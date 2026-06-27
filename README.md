@@ -1,5 +1,7 @@
 # ReSTIR LoD
 
+![](teaser.png)
+
 This repository contains the implementation of *"Real-Time Level-of-Detail Rendering with ReSTIR"* by Yu-Chen Wang, Markus Kettunen, Daqi Lin, Chris Wyman, Lifan Wu, and Shuang Zhao. Built on NVIDIA's [Falcor 8.0](https://github.com/NVIDIAGameWorks/Falcor) framework and the [Reservoir Splatting](README_falcor.md) codebase, our method couples ReSTIR temporal path resampling with dynamic level-of-detail (LoD) selection, allocating geometric detail where it matters while keeping temporal reuse stable across LoD transitions.
 
 ## Major changes
@@ -31,6 +33,8 @@ Scripts are invoked through `argparse` subcommands (`render`, `gt`, `pt`), each 
 ## Running an example
 
 We provide the **Chessboard** example, which renders a focus-pull sequence: the camera's focal distance is animated over time, changing the depth-of-field blur and driving the dynamic LoD selection. The rendering scripts live under `python/`.
+
+The Chessboard scene (models, textures, and `.pyscene` files) is not included in this repository. Download it from [Google Drive](https://drive.google.com/drive/folders/1OHftz_x2Bw41rx7EqXzU-PYFN4zqyvkP?usp=sharing) and place it under `scenes/Chessboard/`.
 
 ### 1. Build the project
 
