@@ -26,6 +26,7 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
 #include "SceneBuilder.h"
+#include "LoDUtils.h"
 #include "SceneCache.h"
 #include "Importer.h"
 #include "Curves/CurveConfig.h"
@@ -360,7 +361,7 @@ namespace Falcor
         optimizeSceneGraph();
         calculateMeshBoundingBoxes();
         createMeshGroups();
-        optimizeGeometry();
+        // optimizeGeometry();
         sortMeshes();
         createGlobalBuffers();
         createCurveGlobalBuffers();
@@ -469,6 +470,14 @@ namespace Falcor
         processedMesh.isFrontFaceCW = mesh.isFrontFaceCW;
         processedMesh.isAnimated = mesh.isAnimated;
         processedMesh.skeletonNodeId = mesh.skeletonNodeId;
+
+        int lodIndex = static_cast<int>(mMeshes.size());
+        if (auto result = parseLodMeshName(mesh.name)) {
+            auto [loDName, lodLevel] = *result;
+            if (mSceneData.loDNameToIndex.find(loDName) != mSceneData.loDNameToIndex.end()) {
+                lodIndex = mSceneData.loDNameToIndex.at(loDName);
+            }
+        }
 
         // Error checking.
         auto throw_on_missing_element = [&](const std::string& element)
@@ -664,6 +673,7 @@ namespace Falcor
 
         // Copy vertices into processed mesh.
         processedMesh.staticData.resize(vertexCount);
+        processedMesh.uvStaticData.resize(vertexCount);
         if (mesh.hasBones()) processedMesh.skinningData.resize(vertexCount);
 
         for (uint32_t i = 0; i < vertexCount; i++)
@@ -680,6 +690,17 @@ namespace Falcor
                 s.tangent = v.tangent;
                 s.curveRadius = v.curveRadius;
                 processedMesh.staticData[i] = s;
+            }
+
+            // Build information for UV BVH.
+            {
+                StaticVertexData s;
+                s.position = float3(lodIndex * 0.01f, v.texCrd);
+                s.normal = v.normal;
+                s.texCrd = v.texCrd;
+                s.tangent = v.tangent;
+                s.curveRadius = v.curveRadius;
+                processedMesh.uvStaticData[i] = s;
             }
 
             if (mesh.hasBones())
@@ -743,6 +764,7 @@ namespace Falcor
         spec.materialId = addMaterial(mesh.pMaterial);
         spec.isFrontFaceCW = mesh.isFrontFaceCW;
         spec.isAnimated = mesh.isAnimated;
+        spec.isLoDMesh = isLoDMesh(mesh.name);
         spec.skeletonNodeID = mesh.skeletonNodeId;
 
         spec.vertexCount = (uint32_t)mesh.staticData.size();
@@ -751,6 +773,7 @@ namespace Falcor
 
         spec.indexData = std::move(mesh.indexData);
         spec.staticData = std::move(mesh.staticData);
+        spec.uvStaticData = std::move(mesh.uvStaticData);
         spec.skinningData = std::move(mesh.skinningData);
 
         if (isIndexed)
@@ -764,6 +787,13 @@ namespace Falcor
             FALCOR_ASSERT(spec.skinningVertexCount > 0);
             spec.hasSkinningData = true;
             spec.prevVertexCount = spec.skinningVertexCount;
+        }
+
+        if (auto result = parseLodMeshName(mesh.name)) {
+            auto [loDName, lodLevel] = *result;
+            if (mSceneData.loDNameToIndex.find(loDName) == mSceneData.loDNameToIndex.end()) {
+                mSceneData.loDNameToIndex[loDName] = static_cast<int>(mMeshes.size());
+            }
         }
 
         mMeshes.push_back(spec);
@@ -1096,6 +1126,7 @@ namespace Falcor
         FALCOR_CHECK(nodeID.get() < mSceneGraph.size(), "'nodeID' ({}) is out of range", nodeID);
         FALCOR_CHECK(meshID.get() < mMeshes.size(), "'meshID' ({}) is out of range", meshID);
 
+        logInfo("Adding mesh instance: nodeID={}, meshID={}", nodeID, meshID);
         mSceneGraph[nodeID.get()].meshes.push_back(meshID);
         mMeshes[meshID.get()].instances.insert(nodeID);
     }
@@ -1858,6 +1889,8 @@ namespace Falcor
         meshList staticMeshes;
         meshList staticDisplacedMeshes;
         meshList dynamicDisplacedMeshes;
+        meshList loDMeshes;
+        meshList dynamicLoDMeshes;
         size_t nonInstancedMeshCount = 0;
 
         for (MeshID meshID{ 0 }; meshID.get() < (uint32_t)mMeshes.size(); ++meshID)
@@ -1872,7 +1905,9 @@ namespace Falcor
             const auto& pMaterial = mSceneData.pMaterials->getMaterial(mesh.materialId);
             if (pMaterial->isDisplaced()) mesh.isDisplaced = true;
 
-            if (mesh.isStatic && mesh.isDisplaced) staticDisplacedMeshes.push_back(meshID);
+            if (mesh.isLoDMesh && isNodeAnimated(nodeID)) dynamicLoDMeshes.push_back(meshID);
+            else if (mesh.isLoDMesh) loDMeshes.push_back(meshID);
+            else if (mesh.isStatic && mesh.isDisplaced) staticDisplacedMeshes.push_back(meshID);
             else if (mesh.isStatic) staticMeshes.push_back(meshID);
             else if (!mesh.isStatic && mesh.isDisplaced) dynamicDisplacedMeshes.push_back(meshID);
             else nodeToMeshList[nodeID].push_back(meshID);
@@ -1882,12 +1917,13 @@ namespace Falcor
         // Validate that mesh counts add up.
         size_t nonInstancedDynamicMeshCount = 0;
         for (const auto& it : nodeToMeshList) nonInstancedDynamicMeshCount += it.second.size();
-        FALCOR_ASSERT(staticMeshes.size() + staticDisplacedMeshes.size() + dynamicDisplacedMeshes.size() + nonInstancedDynamicMeshCount == nonInstancedMeshCount);
+        FALCOR_ASSERT(loDMeshes.size() + dynamicLoDMeshes.size() + staticMeshes.size() + staticDisplacedMeshes.size() + dynamicDisplacedMeshes.size() + nonInstancedDynamicMeshCount == nonInstancedMeshCount);
 
         // Classify instanced meshes.
         // The instanced meshes are grouped based on their lists of instances.
         // Meshes with an identical set of instances can be placed together in a BLAS.
         std::map<std::set<NodeID>, meshList> instancesToMeshList;
+        std::map<std::set<NodeID>, meshList> instancesToLoDMeshList;
         std::map<std::set<NodeID>, meshList> displacedInstancesToMeshList;
         size_t instancedMeshCount = 0;
 
@@ -1901,6 +1937,7 @@ namespace Falcor
             if (pMaterial->isDisplaced()) mesh.isDisplaced = true;
 
             if (mesh.isDisplaced) displacedInstancesToMeshList[mesh.instances].push_back(meshID);
+            else if (mesh.isLoDMesh) instancesToLoDMeshList[mesh.instances].push_back(meshID);
             else instancesToMeshList[mesh.instances].push_back(meshID);
             instancedMeshCount++;
         }
@@ -1920,9 +1957,15 @@ namespace Falcor
             displacedInstancedMeshes.insert(it.second.begin(), it.second.end());
             displacedInstancedCount += it.second.size();
         }
-        if ((instancedCount + displacedInstancedCount) != instancedMeshCount ||
-            (instancedMeshes.size() + displacedInstancedMeshes.size()) != instancedMeshCount) FALCOR_THROW("Error in instanced mesh grouping logic");
-
+        std::set<MeshID> loDInstancedMeshes;
+        size_t instancedLoDCount = 0;
+        for (const auto& it : instancesToLoDMeshList)
+        {
+            loDInstancedMeshes.insert(it.second.begin(), it.second.end());
+            instancedLoDCount += it.second.size();
+        }
+        if ((instancedCount + displacedInstancedCount + instancedLoDCount) != instancedMeshCount ||
+            (instancedMeshes.size() + displacedInstancedMeshes.size() + loDInstancedMeshes.size()) != instancedMeshCount) FALCOR_THROW("Error in instanced mesh grouping logic");
         logInfo("Found {} static non-instanced meshes, arranged in 1 mesh group.", staticMeshes.size());
         logInfo("Found {} displaced non-instanced meshes, arranged in 1 mesh group.", staticDisplacedMeshes.size());
         logInfo("Found {} dynamic non-instanced meshes, arranged in {} mesh groups.", nonInstancedDynamicMeshCount, nodeToMeshList.size());
@@ -1960,6 +2003,11 @@ namespace Falcor
             addMeshes(it.second, false, false, is_set(mFlags, Flags::RTDontMergeInstanced));
         }
 
+        for (const auto& it : instancesToLoDMeshList)
+        {
+            addMeshes(it.second, false, false, true);
+        }
+
         // All static displaced meshes go in a single group or individual groups depending on config.
         if (!staticDisplacedMeshes.empty())
         {
@@ -1970,6 +2018,15 @@ namespace Falcor
         if (!dynamicDisplacedMeshes.empty())
         {
             addMeshes(dynamicDisplacedMeshes, false, true, is_set(mFlags, Flags::RTDontMergeDynamic));
+        }
+
+        if (!loDMeshes.empty()) {
+            addMeshes(loDMeshes, true, false, true);
+        }
+
+        // Dynamic LoD meshes: each gets its own BLAS with isStatic=false so transforms are applied at runtime.
+        if (!dynamicLoDMeshes.empty()) {
+            addMeshes(dynamicLoDMeshes, false, false, true);
         }
 
         // Instanced displaced meshes are grouped based on instance lists.
@@ -2450,6 +2507,7 @@ namespace Falcor
             // Insert the static vertex data in the global array.
             // The vertices are automatically converted to their packed format in this step.
             mesh.staticVertexOffset = mSceneData.meshStaticData.insert(mesh.staticData.begin(), mesh.staticData.end());
+            mSceneData.meshUVStaticData.insert(mesh.uvStaticData.begin(), mesh.uvStaticData.end());
 
             if (isIndexed)
             {
@@ -2818,12 +2876,26 @@ namespace Falcor
             drawCount += instanceCount * meshList.size();
         }
 
+        mSceneData.meshIDToLoDIndex.resize(mMeshes.size(), 0);
+        for (uint32_t meshID = 0; meshID < mMeshes.size(); meshID++)
+        {
+            const auto& mesh = mMeshes[meshID];
+            uint32_t lodIndex = meshID;
+            if (auto result = parseLodMeshName(mesh.name)) {
+                auto [lodName, lodLevel] = *result;
+                lodIndex = mSceneData.loDNameToIndex.at(lodName);
+            }
+            mSceneData.meshIDToLoDIndex[meshID] = lodIndex;
+        }
+
         // Create mapping of mesh IDs to their instance IDs.
         mSceneData.meshIdToInstanceIds.resize(mMeshes.size());
+        mSceneData.instanceIDToLoDIndex.resize(instanceData.size(), 0);
         for (uint32_t instanceID = 0; instanceID < (uint32_t)instanceData.size(); instanceID++)
         {
             const auto& instance = instanceData[instanceID];
             mSceneData.meshIdToInstanceIds[instance.geometryID].push_back(instanceID);
+            mSceneData.instanceIDToLoDIndex[instanceID] = mSceneData.meshIDToLoDIndex[instance.geometryID];
         }
 
         // Setup mesh groups. This just copies our final list.

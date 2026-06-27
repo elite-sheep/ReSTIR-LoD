@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
@@ -244,11 +244,11 @@ cbuffer CB
 // Shader entry point for ray generation shader.
 //
 
-[shader("raygeneration")]
-void rayGen()
+[numthreads(8, 16, 1)]
+void main(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    uint2 pixel = dispatchThreadId.xy;
+    uint2 frameDim = gGatherTemporalResampling.params.frameDim;
     if (all(pixel >= frameDim)) return;
 
     printSetPixel(pixel);

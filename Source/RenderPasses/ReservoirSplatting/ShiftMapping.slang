@@ -25,11 +25,12 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
 
+import Scene.RaytracingInline;
 import Utils.Color.ColorHelpers;
 import Utils.Debug.PixelDebug;
 import Utils.Sampling.SampleGenerator;
@@ -40,13 +41,59 @@ import ReconnectionData;
 
 ParameterBlock<PathTracer> gPathTracer;
 
+float3 randomReplay(uint pathID,
+                    const ReconnectionData reconnectionData,
+                    const bool isPrevFrame = false)
+{
+    PathState path = {};
+    path.setActive();
+    path.thp = float3(1.0f);
+
+    gPathTracer.generatePathForRandomReplay(path,
+                                            reconnectionData.seed,
+                                            pathID,
+                                            isPrevFrame);
+
+    // // Handle primary hit/miss.
+    gPathTracer.nextHit(path, isPrevFrame);
+    print("reconnection.pathLength:", reconnectionData.pathLength);
+    if (path.isHit())
+    {
+        gPathTracer.handleHitForRandomReplay(path, reconnectionData);
+        print("after primary hit radiance:", path.reservoir.integrand);
+    }
+    else
+    {
+        // Note that there is no GeneratePaths pass in this case, so missed primary hits need to be handled here.
+        gPathTracer.handlePrimaryMiss(path);
+        return float3(0.0f);
+    }
+
+    // Trace path.
+    for (uint i = path.getVertexIndex(); path.isActive() && i <= reconnectionData.pathLength + 1; ++i)
+    {
+        gPathTracer.nextHit(path, isPrevFrame);
+        if (path.isHit())
+        {
+            gPathTracer.handleHitForRandomReplay(path, reconnectionData);
+        }
+        else
+        {
+            gPathTracer.handleMiss(path);
+        }
+
+    }
+
+    return path.reservoir.integrand;
+}
+
 float computePrimaryHitCircleOfConfusion(float3 x1)
 {
     Camera camera = gScene.camera;
     float lensRadius = camera.data.apertureRadius;
 
     // Compute via similar triangles;
-    // Lens radius / lens distance to x1 == Film radius / film distance to x1. 
+    // Lens radius / lens distance to x1 == Film radius / film distance to x1.
     float3 camDir = normalize(camera.data.cameraW);
     float camZ = dot(x1 - camera.data.posW, camDir);
     float filmZ = camZ - length(camera.data.cameraW);
@@ -144,6 +191,13 @@ ShiftedPathData gatherLensVertexCopyShift(SampleGenerator sg, inout Reconnection
         float d0 = (length(camera.data.cameraW) / abs(camZ) * dist);
         float d1 = dist - d0;
         shiftedPath.lensVertexJacobian = (d0 * d0) / (d1 * d1) * abs(cosNormal) / abs(cosSensor);
+
+        shiftedPath.primaryHitUV = firstSd.uv;
+        {
+            float objectSpaceArea = gScene.getTriangleArea(path.hit.getTriangleHit());
+            float uvSpaceArea = gScene.getUVTriangleArea(path.hit.getTriangleHit());
+            shiftedPath.firstHitJacobian = uvSpaceArea > 0.0f ? objectSpaceArea / uvSpaceArea : 0.0f;
+        }
     }
     else
     {
@@ -162,7 +216,7 @@ ShiftedPathData gatherLensVertexCopyShift(SampleGenerator sg, inout Reconnection
         float focalPlaneZ = length(camera.data.cameraW);
         float d0 = focalPlaneZ / dot(camDir, path.dir);
         shiftedPath.lensVertexJacobian = (d0 * d0) / abs(cosSensor);
-        
+
         return shiftedPath;
     }
 
@@ -172,6 +226,9 @@ ShiftedPathData gatherLensVertexCopyShift(SampleGenerator sg, inout Reconnection
         shiftedPath.radiance = gPathTracer.handleReconnectionPrimaryLight(path);
         return shiftedPath;
     }
+
+    shiftedPath.secondHit = reconnectionData.secondHit;
+    shiftedPath.secondHitUV = reconnectionData.secondTextureUV;
 
     // Next compute the remaining path reconnection.
     shiftedPath.radiance = pathReconnectionShift(reconnectionData, path, shiftedPath.secondaryPathJacobian);
@@ -214,6 +271,8 @@ ShiftedPathData gatherPrimaryHitReconnectionShift(SampleGenerator sg, inout Reco
         x1 = sd.posW;
         path.dir = normalize(x1 - filmWorld);
         n = sd.faceN;
+
+        shiftedPath.primaryHitUV = sd.uv;
     }
 
     // Compute where the ray would've started (along the lens plane).
@@ -225,7 +284,7 @@ ShiftedPathData gatherPrimaryHitReconnectionShift(SampleGenerator sg, inout Reco
 
     // If the new ray would be outside the lens aperture, the shift fails.
     float3 lensOffsetWorld = path.origin - camera.data.posW;
-    float2 lensLocalNormalized = float2(dot(lensOffsetWorld, normalize(camera.data.cameraU)), 
+    float2 lensLocalNormalized = float2(dot(lensOffsetWorld, normalize(camera.data.cameraU)),
                                         dot(lensOffsetWorld, normalize(camera.data.cameraV)))
                                     / camera.data.apertureRadius;
     if (length(lensLocalNormalized) > 1.0f)
@@ -280,6 +339,12 @@ ShiftedPathData gatherPrimaryHitReconnectionShift(SampleGenerator sg, inout Reco
         float d0 = (length(camera.data.cameraW) / abs(camZ) * rayT);
         float d1 = rayT - d0;
         shiftedPath.lensVertexJacobian = (d0 * d0) / (d1 * d1) * (abs(cosNormal)) / (abs(cosSensor));
+
+        {
+            float objectSpaceArea = gScene.getTriangleArea(primaryHit.getTriangleHit());
+            float uvSpaceArea = gScene.getUVTriangleArea(primaryHit.getTriangleHit());
+            shiftedPath.firstHitJacobian = uvSpaceArea > 0.0f ? objectSpaceArea / uvSpaceArea : 0.0f;
+        }
     }
 
     // If the previous reservoir stores a primary light hit, we should now evaluate the emission at this primary hit.
@@ -289,6 +354,9 @@ ShiftedPathData gatherPrimaryHitReconnectionShift(SampleGenerator sg, inout Reco
         return shiftedPath;
     }
 
+    shiftedPath.secondHit = reconnectionData.secondHit;
+    shiftedPath.secondHitUV = reconnectionData.secondTextureUV;
+
     // Next compute the remaining path reconnection.
     shiftedPath.radiance = pathReconnectionShift(reconnectionData, path, shiftedPath.secondaryPathJacobian);
 
@@ -296,9 +364,16 @@ ShiftedPathData gatherPrimaryHitReconnectionShift(SampleGenerator sg, inout Reco
 }
 
 // Some visibility checks are done during the scattering stage (e.g., from the previous to current frame, so don't check it again).
-// Note that unlike the "time" parameter, the "pixel" parameter here is the domain we're shifting *from*. 
+// Note that unlike the "time" parameter, the "pixel" parameter here is the domain we're shifting *from*.
 // It's only used when we have an environment map sample, and we need the fractional coord to reconstruct the ray direction.
-ShiftedPathData scatterReprojectionShift(SampleGenerator sg, inout ReconnectionData reconnectionData, const float time, const HitInfo primaryHit, const float2 lensSample, bool skipVisibilityCheck = false)
+ShiftedPathData scatterReprojectionShift(SampleGenerator sg,
+                                         inout ReconnectionData reconnectionData,
+                                         const float time,
+                                         const HitInfo primaryHit,
+                                         const float2 lensSample,
+                                         bool skipVisibilityCheck = false,
+                                         bool isPrevFrame = false,
+                                         bool usePrevTransforms = false)
 {
     ShiftedPathData shiftedPath;
 
@@ -327,11 +402,12 @@ ShiftedPathData scatterReprojectionShift(SampleGenerator sg, inout ReconnectionD
     }
     else
     {
-        ShadingData firstSd = loadShadingData(primaryHit, camera.data.posW, float3(0.0f, 0.0f, 0.0f));
+        ShadingData firstSd = loadShadingData(primaryHit, camera.data.posW, float3(0.0f, 0.0f, 0.0f), usePrevTransforms);
         x1 = firstSd.posW;
         n = firstSd.faceN;
 
         path.dir = normalize(x1 - path.origin);
+        shiftedPath.primaryHitUV = firstSd.uv;
     }
 
     // Convert the new ray to camera space.
@@ -361,7 +437,7 @@ ShiftedPathData scatterReprojectionShift(SampleGenerator sg, inout ReconnectionD
     float dist = length(x1 - path.origin);
     float rayMax = hitEnvMap ? kRayTMax : 0.999f * dist;
     Ray visibilityRay = Ray(path.origin, path.dir, 0.001f, rayMax);
-    if (!skipVisibilityCheck && !gPathTracer.traceVisibilityRay(visibilityRay))
+    if (!skipVisibilityCheck && !gPathTracer.traceVisibilityRay(visibilityRay, isPrevFrame))
     {
         shiftedPath = ShiftedPathData();
         return shiftedPath;
@@ -405,17 +481,41 @@ ShiftedPathData scatterReprojectionShift(SampleGenerator sg, inout ReconnectionD
         float d0 = (length(camera.data.cameraW) / abs(camZ) * dist);
         float d1 = dist - d0;
         shiftedPath.lensVertexJacobian = (d0 * d0) / (d1 * d1) * abs(cosNormal) / abs(cosSensor);
+
+        {
+            float objectSpaceArea = gScene.getTriangleArea(primaryHit.getTriangleHit());
+            float uvSpaceArea = gScene.getUVTriangleArea(primaryHit.getTriangleHit());
+            shiftedPath.firstHitJacobian = uvSpaceArea > 0.0f ? objectSpaceArea / uvSpaceArea : 0.0f;
+        }
     }
-    
+
     // If our temporal reservoir only had a hit length of 1 at this point, we must've hit a light source.
     if (reconnectionData.pathLength == 1)
     {
         shiftedPath.radiance = gPathTracer.handleReconnectionPrimaryLight(path);
         return shiftedPath;
     }
+    else
+    {
+        uint secondHitLoDIndex = gScene.instanceIDToLoDIndex[reconnectionData.secondHit.getInstanceID().index];
+        if (reconnectionData.secondHit.isValid() &&
+            gScene.loDLevels[secondHitLoDIndex] != gScene.prevLoDLevels[secondHitLoDIndex])
+        {
+            shiftedPath.secondHit = geometricLoDShift(reconnectionData.secondHit,
+                                                      reconnectionData.secondTextureUV,
+                                                      shiftedPath.secondHitGeometricJacobian,
+                                                      isPrevFrame);
+        }
+        else
+        {
+            shiftedPath.secondHit = reconnectionData.secondHit;
+        }
+        shiftedPath.secondHitUV = reconnectionData.secondTextureUV;
+    }
 
     // Next compute the remaining path reconnection.
-    shiftedPath.radiance = pathReconnectionShift(reconnectionData, path, shiftedPath.secondaryPathJacobian);
+    shiftedPath.radiance = pathReconnectionShiftForScattering(reconnectionData, shiftedPath.secondHit,
+                                                              path, shiftedPath.secondaryPathJacobian, isPrevFrame, usePrevTransforms);
 
     return shiftedPath;
 }
@@ -427,13 +527,18 @@ ShiftedPathData scatterReprojectionShift(SampleGenerator sg, inout ReconnectionD
  * @param[out] dstJacobian The destination Jacobian of the shift.
  * @return The radiance after the shift (in the relevant domain).
  */
-float3 pathReconnectionShift(inout ReconnectionData reconnectionData, inout PathState path, out float dstJacobian)
+float3 pathReconnectionShiftForScattering(inout ReconnectionData reconnectionData,
+                                          const HitInfo secondHit,
+                                          inout PathState path,
+                                          out float dstJacobian,
+                                          bool isPrevFrame = false,
+                                          bool usePrevTransforms = false)
 {
     // At this point, we have found a valid primary hit.
     // The reconnection path already provides a second hit (or direction),
     // so shoot a ray in that direction (with the correct throughput).
     dstJacobian = 1.0f;
-    float3 y_1 = gPathTracer.handleReconnectionHit(path, reconnectionData, dstJacobian);
+    float3 y_1 = gPathTracer.handleReconnectionHitForScattering(path, reconnectionData, secondHit, dstJacobian, isPrevFrame, usePrevTransforms);
 
     // If the path is not valid, then the shift fails.
     if (!path.isActive())
@@ -441,9 +546,9 @@ float3 pathReconnectionShift(inout ReconnectionData reconnectionData, inout Path
         return float3(0.0f, 0.0f, 0.0f);
     }
 
-    ShadingData secondSd = loadShadingData(reconnectionData.secondHit, path.origin, path.dir);
+    ShadingData secondSd = loadShadingData(secondHit, path.origin, path.dir, usePrevTransforms);
 
-    // There are three cases now: 
+    // There are three cases now:
     // If the path is length 2, then we directly use the irradiance (MIS weights are already accounted for).
     // If the path length is 3, then we need to recompute the MIS weight as well.
     // If the path length is greater than 3, then we need to update the throughput before using the irradiance.
@@ -510,4 +615,140 @@ float3 pathReconnectionShift(inout ReconnectionData reconnectionData, inout Path
     // print("Final Irradiance", reconnectionData.irradiance);
     // print("Dst Jacobian", dstJacobian);
     return misWeight * path.thp * reconnectionData.irradiance;
+}
+
+/**
+ * Transform a path with a primary hit into a fully shifted sample.
+ * @param[inout] reconnectionData The reconnection data to use.
+ * @param[inout] path Path state after the primary hit.
+ * @param[out] dstJacobian The destination Jacobian of the shift.
+ * @return The radiance after the shift (in the relevant domain).
+ */
+float3 pathReconnectionShift(inout ReconnectionData reconnectionData, inout PathState path, out float dstJacobian, bool isPrevFrame = false)
+{
+    // At this point, we have found a valid primary hit.
+    // The reconnection path already provides a second hit (or direction),
+    // so shoot a ray in that direction (with the correct throughput).
+    dstJacobian = 1.0f;
+    float3 y_1 = gPathTracer.handleReconnectionHit(path, reconnectionData, dstJacobian, isPrevFrame);
+
+    // If the path is not valid, then the shift fails.
+    if (!path.isActive())
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    ShadingData secondSd = loadShadingData(reconnectionData.secondHit, path.origin, path.dir);
+
+    // There are three cases now:
+    // If the path is length 2, then we directly use the irradiance (MIS weights are already accounted for).
+    // If the path length is 3, then we need to recompute the MIS weight as well.
+    // If the path length is greater than 3, then we need to update the throughput before using the irradiance.
+    let hints = getMaterialInstanceHints(path.hit, false);
+    let lod = ExplicitLodTextureSampler(0);
+    const IMaterialInstance mi = gScene.materials.getMaterialInstance(secondSd, lod, hints);
+
+    secondSd.mtl.setLobeMask(1 << reconnectionData.secondBSDFComponentType);
+    float3 lobeSpecificBsdf = mi.eval(secondSd, reconnectionData.secondWo, path.sg);
+    float lobeSpecificPdf = mi.evalPdf(secondSd, reconnectionData.secondWo, true);
+
+    secondSd.mtl.setLobeMask(0xF);
+    float3 totalBsdf = mi.eval(secondSd, reconnectionData.secondWo, path.sg);
+    float totalPdf = mi.evalPdf(secondSd, reconnectionData.secondWo, true);
+
+    // TODO: this could probably also be placed in a better location.
+    if (reconnectionData.pathLength > 2 && !any(totalBsdf > 0.0f))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+
+    float misWeight = 1.0f;
+    if (reconnectionData.pathLength == 3)
+    {
+        bool valid = reconnectionData.lightIsNEE ? true : (lobeSpecificPdf > 0.0f);
+        if (!valid)
+        {
+            return float3(0.0f, 0.0f, 0.0f);
+        }
+
+        // When the path length is only 3 and the light was sampled by NEE,
+        // the reconnection data's lightPdf stores the solid angle measure instead of the area measure.
+        misWeight = reconnectionData.lightIsNEE ? PathTracer::evalMIS(1, reconnectionData.lightPdf, 1, totalPdf) :
+                                                      PathTracer::evalMIS(1, totalPdf, 1, reconnectionData.lightPdf);
+        float3 lightConnectionThp = reconnectionData.lightIsNEE ? totalBsdf / reconnectionData.lightPdf : lobeSpecificBsdf / lobeSpecificPdf;
+
+        // print("Lobe Specific BSDF", lobeSpecificBsdf);
+        // print("Lobe Specific Pdf", lobeSpecificPdf);
+        // print("Total BSDF", totalBsdf);
+        // print("Light PDF", reconnectionData.lightPdf);
+        // print("Light Connection Throughput", lightConnectionThp);
+
+        path.thp *= lightConnectionThp;
+
+        // If the light was selected by NEE, the src / dst Jacobians cancel out.
+        // Otherwise, we must account for the difference in BSDF sampling.
+        dstJacobian *= reconnectionData.lightIsNEE ? 1.0f : lobeSpecificPdf;
+    }
+    else if (reconnectionData.pathLength > 3)
+    {
+        if (!(lobeSpecificPdf > 0.0f))
+        {
+            return float3(0.0f, 0.0f, 0.0f);
+        }
+        path.thp *= lobeSpecificBsdf / lobeSpecificPdf;
+        dstJacobian *= lobeSpecificPdf;
+
+        // print("Lobe Specific Bsdf", lobeSpecificBsdf);
+        // print("Lobe Specific Pdf", lobeSpecificPdf);
+    }
+
+    // print("MIS Weight", misWeight);
+    // print("Final Path Throughput", path.thp);
+    // print("Final Irradiance", reconnectionData.irradiance);
+    // print("Dst Jacobian", dstJacobian);
+    return misWeight * path.thp * reconnectionData.irradiance;
+}
+
+HitInfo geometricLoDShift(const HitInfo originalHit, const float2 textureUV, out float jacobian, bool isPrevFrame = false)
+{
+    HitInfo shiftedHit;
+    uint lodIndex = gScene.instanceIDToLoDIndex[originalHit.getInstanceID().index];
+    int lodLevel = isPrevFrame ? gScene.prevLoDLevels[lodIndex] : gScene.loDLevels[lodIndex];
+    SceneUVRayQuery uvQuery;
+    Ray uvRay = Ray(float3(lodIndex * kUVCompressRatio - kUVRayEpsilon, textureUV),
+                    float3(1.0, 0.0, 0.0),
+                    0.0f, kUVRayTMax);
+    uint uvRayInstanceID = (1 << lodLevel);
+    UVHitInfo uvHitInfo = uvQuery.traceRay(uvRay, RAY_FLAG_FORCE_NON_OPAQUE, uvRayInstanceID);
+    // shiftedHit = findCloestHitInUVHitInfo(uvHitInfo, originalHit);
+
+    int prevLoDLevel = isPrevFrame ? gScene.loDLevels[lodIndex] : gScene.prevLoDLevels[lodIndex];
+    SceneUVRayQuery prevUVQuery;
+    Ray prevUVRay = Ray(float3(lodIndex * kUVCompressRatio - kUVRayEpsilon, textureUV),
+                        float3(1.0, 0.0, 0.0),
+                        0.0f, kUVRayTMax);
+    uint prevUVRayInstanceID = (1 << prevLoDLevel);
+    UVHitInfo prevUVHitInfo = prevUVQuery.traceRay(prevUVRay, RAY_FLAG_FORCE_NON_OPAQUE, prevUVRayInstanceID);
+    shiftedHit = matchUVHitInfo(prevUVHitInfo, uvHitInfo, originalHit);
+
+    if (!shiftedHit.isValid())
+    {
+        jacobian = 0.0f;
+        return shiftedHit;
+    }
+
+    float3 prevTrianglePos[3], curTrianglePos[3];
+    float2 prevTriangleUV[3], curTriangleUV[3];
+    gScene.getTriangleVerticesPos(shiftedHit.getTriangleHit(), prevTrianglePos);
+    gScene.getTriangleVerticesUVs(shiftedHit.getTriangleHit(), prevTriangleUV);
+    gScene.getTriangleVerticesPos(originalHit.getTriangleHit(), curTrianglePos);
+    gScene.getTriangleVerticesUVs(originalHit.getTriangleHit(), curTriangleUV);
+    float shiftedFirstHitJacobian = gPathTracer.computeJacobianUVToWorld(prevTrianglePos[0], prevTrianglePos[1], prevTrianglePos[2],
+                                                                     prevTriangleUV[0], prevTriangleUV[1], prevTriangleUV[2]);
+    float originalFirstHitJacobian = gPathTracer.computeJacobianUVToWorld(curTrianglePos[0], curTrianglePos[1], curTrianglePos[2],
+                                                                     curTriangleUV[0], curTriangleUV[1], curTriangleUV[2]);
+
+    jacobian = originalFirstHitJacobian > 0.0f ?  shiftedFirstHitJacobian / originalFirstHitJacobian : 0.0f;
+
+    return shiftedHit;
 }

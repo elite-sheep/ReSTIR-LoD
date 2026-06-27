@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 import Utils.Color.ColorHelpers;
 import Utils.Debug.PixelDebug;
@@ -80,7 +80,7 @@ struct CollectTemporalSamples
         // Other shifts use the motion vector to check where the current pixel was in the previous frame.
         float2 motionVector = motionVectors[currPixel];
         // TODO: without this band-aid, the hybrid + fast will diverge with static camera / scene.
-        motionVector = (length(motionVector) < 1e-06) ? float2(0.0f, 0.0f) : motionVector; 
+        motionVector = (length(motionVector) < 1e-06) ? float2(0.0f, 0.0f) : motionVector;
         float2 prevPixel = float2(currPixel) + motionVector * float2(params.frameDim);
 
         // print("Current Pixel", currPixel);
@@ -190,9 +190,9 @@ struct CollectTemporalSamples
                         // (0, 0) means that no shift was required.
                         bool noShiftNeeded = (offsetIndex == 4);
                         offsetIndex = (offsetIndex > 4) ? offsetIndex - 1 : offsetIndex;
-                        ShiftedPathData shiftedPath = noShiftNeeded ? 
+                        ShiftedPathData shiftedPath = noShiftNeeded ?
                             ShiftedPathData(neighborReconnection.firstHit, float2(neighborPixel) + neighborReservoir.subPixel, neighborReconnection.lensSample, -neighborReconnection.firstWi,
-                                            neighborReconnection.subPixelJacobian, neighborReconnection.lensVertexJacobian, neighborReconnection.secondaryPathJacobian, neighborReservoir.integrand) 
+                                            neighborReconnection.subPixelJacobian, neighborReconnection.firstHitJacobian, neighborReconnection.lensVertexJacobian, neighborReconnection.secondaryPathJacobian, neighborReservoir.integrand)
                             : shiftedPaths[8 * neighborIndex + offsetIndex];
                         float shiftedJacobian = noShiftNeeded ? 1.0f : shiftedPath.secondaryPathJacobian / neighborReconnection.secondaryPathJacobian;
 

@@ -35,6 +35,7 @@
 import Utils.Attributes;
 import Scene.Intersection;
 import Scene.SDFs.SDFGridHitData;
+import Utils.Debug.PixelDebug;
 __exported import Scene.Shading;
 __exported import Scene.SceneRayQueryInterface;
 
@@ -83,9 +84,16 @@ TriangleHit getCandidateTriangleHit<let Flags : int>(RayQuery<Flags> rayQuery)
 
 
 // TODO: Pass UseAlphaTest as a template argument.
-HitInfo traceSceneRayImpl<let Flags : int>(const bool useAlphaTest, inout RayQuery<Flags> rayQuery, const Ray ray, out float hitT, uint rayFlags, uint instanceInclusionMask)
+HitInfo traceSceneRayImpl<let Flags : int>(const bool useAlphaTest, inout RayQuery<Flags> rayQuery, const Ray ray, out float hitT, uint rayFlags, uint instanceInclusionMask, bool isPrevFrame)
 {
-    rayQuery.TraceRayInline(gScene.rtAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+    if (isPrevFrame)
+    {
+        rayQuery.TraceRayInline(gScene.prevRtAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+    }
+    else
+    {
+        rayQuery.TraceRayInline(gScene.rtAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+    }
 
     CurveIntersector::Attribs curveCommittedAttribs;
     DisplacedTriangleMeshIntersector::Attribs displacedTriangleMeshCommittedAttribs;
@@ -225,7 +233,7 @@ HitInfo traceSceneRayImpl<let Flags : int>(const bool useAlphaTest, inout RayQue
 }
 
 [__NoSideEffect] // Required for the performance of reverse-mode auto-diff.
-HitInfo traceSceneRay<let UseAlphaTest : int>(const Ray ray, out float hitT, uint rayFlags, uint instanceInclusionMask)
+HitInfo traceSceneRay<let UseAlphaTest : int>(const Ray ray, out float hitT, uint rayFlags, uint instanceInclusionMask, bool isPrevFrame = false)
 {
     // TODO: Use a constant expression to derive static ray flags.
 
@@ -236,7 +244,7 @@ HitInfo traceSceneRay<let UseAlphaTest : int>(const Ray ray, out float hitT, uin
 #else
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> rayQuery;
 #endif
-        return traceSceneRayImpl(true, rayQuery, ray, hitT, rayFlags, instanceInclusionMask);
+        return traceSceneRayImpl(true, rayQuery, ray, hitT, rayFlags, instanceInclusionMask, isPrevFrame);
     }
     else
     {
@@ -245,14 +253,21 @@ HitInfo traceSceneRay<let UseAlphaTest : int>(const Ray ray, out float hitT, uin
 #else
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> rayQuery;
 #endif
-        return traceSceneRayImpl(false, rayQuery, ray, hitT, rayFlags, instanceInclusionMask);
+        return traceSceneRayImpl(false, rayQuery, ray, hitT, rayFlags, instanceInclusionMask, isPrevFrame);
     }
 }
 
 [__NoSideEffect] // Required for the performance of reverse-mode auto-diff.
-bool traceSceneVisibilityRayImpl<let Flags : int>(const bool useAlphaTest, inout RayQuery<Flags> rayQuery, const Ray ray, uint rayFlags, uint instanceInclusionMask)
+bool traceSceneVisibilityRayImpl<let Flags : int>(const bool useAlphaTest, inout RayQuery<Flags> rayQuery, const Ray ray, uint rayFlags, uint instanceInclusionMask, bool isPrevFrame)
 {
-    rayQuery.TraceRayInline(gScene.rtAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+    if (isPrevFrame)
+    {
+        rayQuery.TraceRayInline(gScene.prevRtAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+    }
+    else
+    {
+        rayQuery.TraceRayInline(gScene.rtAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+    }
 
     while (rayQuery.Proceed())
     {
@@ -322,7 +337,7 @@ bool traceSceneVisibilityRayImpl<let Flags : int>(const bool useAlphaTest, inout
     return rayQuery.CommittedStatus() == COMMITTED_NOTHING;
 }
 
-bool traceSceneVisibilityRay<let UseAlphaTest : int>(const Ray ray, uint rayFlags, uint instanceInclusionMask)
+bool traceSceneVisibilityRay<let UseAlphaTest : int>(const Ray ray, uint rayFlags, uint instanceInclusionMask, bool isPrevFrame = false)
 {
     // TODO: Use a constant expression to derive static ray flags.
 
@@ -333,7 +348,7 @@ bool traceSceneVisibilityRay<let UseAlphaTest : int>(const Ray ray, uint rayFlag
 #else
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> rayQuery;
 #endif
-        return traceSceneVisibilityRayImpl(true, rayQuery, ray, rayFlags, instanceInclusionMask);
+        return traceSceneVisibilityRayImpl(true, rayQuery, ray, rayFlags, instanceInclusionMask, isPrevFrame);
     }
     else
     {
@@ -342,7 +357,7 @@ bool traceSceneVisibilityRay<let UseAlphaTest : int>(const Ray ray, uint rayFlag
 #else
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> rayQuery;
 #endif
-        return traceSceneVisibilityRayImpl(false, rayQuery, ray, rayFlags, instanceInclusionMask);
+        return traceSceneVisibilityRayImpl(false, rayQuery, ray, rayFlags, instanceInclusionMask, isPrevFrame);
     }
 }
 
@@ -350,13 +365,124 @@ bool traceSceneVisibilityRay<let UseAlphaTest : int>(const Ray ray, uint rayFlag
 */
 struct SceneRayQuery<let UseAlphaTest : int> : ISceneRayQuery
 {
-    HitInfo traceRay(const Ray ray, out float hitT, uint rayFlags = RAY_FLAG_NONE, uint instanceInclusionMask = 0xff)
+    HitInfo traceRay(const Ray ray, out float hitT, uint rayFlags = RAY_FLAG_NONE, uint instanceInclusionMask = 0xff, bool isPrevFrame = false)
     {
-        return traceSceneRay<UseAlphaTest>(ray, hitT, rayFlags, instanceInclusionMask);
+        return traceSceneRay<UseAlphaTest>(ray, hitT, rayFlags, instanceInclusionMask, isPrevFrame);
     }
 
-    bool traceVisibilityRay(const Ray ray, uint rayFlags = RAY_FLAG_NONE, uint instanceInclusionMask = 0xff)
+    bool traceVisibilityRay(const Ray ray, uint rayFlags = RAY_FLAG_NONE, uint instanceInclusionMask = 0xff, bool isPrevFrame = false)
     {
-        return traceSceneVisibilityRay<UseAlphaTest>(ray, rayFlags, instanceInclusionMask);
+        return traceSceneVisibilityRay<UseAlphaTest>(ray, rayFlags, instanceInclusionMask, isPrevFrame);
+    }
+}
+
+UVHitInfo traceSceneUVRayImpl<let Flags : int>(const bool useAlphaTest,
+                                             inout RayQuery<Flags> rayQuery,
+                                             const Ray ray,
+                                             uint rayFlags,
+                                             uint instanceInclusionMask)
+{
+    rayQuery.TraceRayInline(gScene.uvRTAccel, rayFlags, instanceInclusionMask, ray.toRayDesc());
+
+    UVHitInfo uvHitInfo = UVHitInfo();
+
+    print("ray.origin:", ray.origin);
+    print("ray.dir:", ray.dir);
+    while (rayQuery.Proceed())
+    {
+#if SCENE_HAS_GEOMETRY_TYPE(GEOMETRY_TYPE_TRIANGLE_MESH)
+        if (rayQuery.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            // Alpha test for non-opaque geometry.
+            const TriangleHit hit = getCandidateTriangleHit(rayQuery);
+            const VertexData v = gScene.getVertexData(hit);
+            const uint materialID = gScene.getMaterialID(hit.instanceID);
+
+            const GeometryInstanceID curInstanceID = hit.instanceID;
+            if (uvHitInfo.count < 8)
+            {
+                uvHitInfo.hits[uvHitInfo.count++] = HitInfo(hit);
+            }
+
+            if (uvHitInfo.count >= 8)
+            {
+                break;
+            }
+            // rayQuery.CommitNonOpaqueTriangleHit();
+        }
+#endif
+    }
+
+    return uvHitInfo;
+}
+
+HitInfo matchUVHitInfo(const UVHitInfo uvHit1, const UVHitInfo uvHit2, const HitInfo hit)
+{
+    bool matched1[8] = { false, false, false, false, false, false, false, false };
+    bool matched2[8] = { false, false, false, false, false, false, false, false };
+    for (int i = 0; i < uvHit1.count; ++i) {
+        int matchIndex1 = -1;
+        int matchIndex2 = -1;
+        float dis = 1e10;
+        for (int j = 0; j < uvHit2.count; ++j) {
+            if (matched2[j]) continue;
+            for (int k = 0; k < uvHit1.count; ++k) {
+                if (matched1[k]) continue;
+                float curDis = length(gScene.getTriangleHitPos(uvHit1.hits[k].getTriangleHit()) -
+                                      gScene.getTriangleHitPos(uvHit2.hits[j].getTriangleHit()));
+                if (curDis < dis) {
+                    dis = curDis;
+                    matchIndex1 = k;
+                    matchIndex2 = j;
+                }
+            }
+        }
+
+        if (matchIndex1 == -1 || matchIndex2 == -1) {
+            break;
+        } else {
+            matched1[matchIndex1] = true;
+            matched2[matchIndex2] = true;
+            if (uvHit1.hits[matchIndex1].getTriangleHit().primitiveIndex == hit.getTriangleHit().primitiveIndex) {
+                return uvHit2.hits[matchIndex2];
+            }
+        }
+    }
+
+    return HitInfo();
+}
+
+HitInfo findCloestHitInUVHitInfo(const UVHitInfo uvHit, const HitInfo hit)
+{
+    if (uvHit.count == 0)
+    {
+        return HitInfo();
+    }
+
+    int resultIndex = 0;
+    float closestDis = length(gScene.getTriangleHitPos(hit.getTriangleHit()) -
+                              gScene.getTriangleHitPos(uvHit.hits[0].getTriangleHit()));
+    for (int i = 1; i < uvHit.count; ++i)
+    {
+        float dis = length(gScene.getTriangleHitPos(hit.getTriangleHit()) -
+                           gScene.getTriangleHitPos(uvHit.hits[i].getTriangleHit()));
+        if (dis < closestDis)
+        {
+            closestDis = dis;
+            resultIndex = i;
+        }
+    }
+
+    return uvHit.hits[resultIndex];
+}
+
+struct SceneUVRayQuery
+{
+    UVHitInfo traceRay(const Ray ray,
+                       uint rayFlags = RAY_FLAG_FORCE_NON_OPAQUE,
+                       uint instanceInclusionMask = 0xff)
+    {
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE> rayQuery;
+        return traceSceneUVRayImpl(false, rayQuery, ray, rayFlags, instanceInclusionMask);
     }
 }

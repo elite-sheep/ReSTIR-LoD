@@ -37,6 +37,7 @@
 #include "Lights/LightCollection.h"
 #include "Lights/LightProfile.h"
 #include "Lights/EnvMap.h"
+#include "LoDUtils.h"
 #include "Camera/Camera.h"
 #include "Camera/CameraController.h"
 #include "Material/MaterialSystem.h"
@@ -269,6 +270,11 @@ namespace Falcor
             std::vector<CachedMesh> cachedMeshes;                   ///< Cached data for vertex-animated meshes.
             uint32_t prevVertexCount = 0;                           ///< Number of vertices that the AnimationController needs to allocate to store previous frame vertices.
 
+            // LoD Information
+            std::unordered_map<std::string, int> loDNameToIndex;
+            std::vector<int> meshIDToLoDIndex;
+            std::vector<int> instanceIDToLoDIndex;
+
             bool useCompressedHitInfo = false;                      ///< True if scene should used compressed HitInfo (on scenes with triangles meshes only).
             bool has16BitIndices = false;                           ///< True if 16-bit mesh indices are used.
             bool has32BitIndices = false;                           ///< True if 32-bit mesh indices are used.
@@ -278,6 +284,8 @@ namespace Falcor
             SplitIndexBuffer meshIndexData;
             /// Vertex attributes for all meshes in packed format.
             SplitVertexBuffer meshStaticData;
+            /// Vertex attributes for all meshes in packed format (UVs).
+            SplitVertexBuffer meshUVStaticData;
             /// Additional vertex attributes for skinned meshes.
             std::vector<SkinningVertexData> meshSkinningData;
 
@@ -973,6 +981,12 @@ namespace Falcor
         bool shouldAccumulate();
         bool viewAccumulation();
 
+        // LoD helper functions
+        bool setLoDLevel(const std::string& loDName, int level);
+        bool raiseLoDLevel(const std::string& loDName);
+        bool lowerLoDLevel(const std::string& loDName);
+        void initLoDInfo(SceneData& SceneData);
+
         /** Get the scene's VAO for meshes.
             The default VAO uses 32-bit vertex indices. For meshes with 16-bit indices, use getMeshVao16() instead.
             \return VAO object or nullptr if no meshes using 32-bit indices.
@@ -1189,6 +1203,15 @@ namespace Falcor
         */
         void buildBlas(RenderContext* pRenderContext);
 
+        void initUVGeomDesc(RenderContext* pRenderContext);
+
+        void prepareUVPrebuildInfo(RenderContext* pRenderContext);
+
+        void computeUVBlasGroups();
+
+        // Generate UV BLAs
+        void buildUVBlas(RenderContext* pRenderContext);
+
         /** Generate data for creating a TLAS.
             #SCENE TODO: Add argument to build descs based off a draw list.
         */
@@ -1202,6 +1225,10 @@ namespace Falcor
         /** Invalidates the TLAS cache.
         */
         void invalidateTlasCache();
+
+        void fillUVInstanceDesc(std::vector<RtInstanceDesc>& instanceDescs, uint32_t rayTypeCount, bool perMeshHitEntry) const;
+        void buildUVTlas(RenderContext* pRenderContext, uint32_t rayTypeCount, bool perMeshHitEntry);
+        void invalidateUVTlasCache();
 
         /** Check whether scene has an index buffer.
         */
@@ -1360,7 +1387,7 @@ namespace Falcor
         bool mDisableSceneChangeNextFrame = false;
         bool mShouldReset = false;
         bool mForceReset = false;
-        
+
         // user interaction
         bool                            mRecordUserInteraction = false;
         int                             mRecordedFrameCount = 0;
@@ -1413,6 +1440,7 @@ namespace Falcor
         UpdateMode mBlasUpdateMode = UpdateMode::Refit;     ///< How the BLAS should be updated when there are changes to meshes.
 
         std::vector<RtInstanceDesc> mInstanceDescs;         ///< Shared between TLAS builds to avoid reallocating CPU memory.
+        std::vector<RtInstanceDesc> mUVInstanceDescs;         ///< Shared between TLAS builds to avoid reallocating CPU memory.
 
         struct TlasData
         {
@@ -1425,7 +1453,15 @@ namespace Falcor
                                                             ///< Number of ray types in program affects Shader Table indexing.
         ref<Buffer> mpTlasScratch;                          ///< Scratch buffer used for TLAS builds. Can be shared as long as instance desc count is the same, which for now it is.
         RtAccelerationStructurePrebuildInfo mTlasPrebuildInfo; ///< This can be reused as long as the number of instance descs doesn't change.
-        uint32_t mTlasLastBuiltRayCount = 0;                ///< RayTypeCount of the last built TLAS, zero if there is none
+        // uint32_t mTlasLastBuiltRayCount = 0;                ///< RayTypeCount of the last built TLAS, zero if there is none
+        uint32_t mFrameIndex = 0;
+        std::unordered_set<uint32_t> mTlasRayTypeCounts;
+
+        std::unordered_map<uint32_t, TlasData> mUVTlasCache;  ///< Top Level Acceleration Structure for scene data cached per shader ray type count.
+                                                            ///< Number of ray types in program affects Shader Table indexing.
+        ref<Buffer> mpUVTlasScratch;                          ///< Scratch buffer used for TLAS builds. Can be shared as long as instance desc count is the same, which for now it is.
+        RtAccelerationStructurePrebuildInfo mUVTlasPrebuildInfo; ///< This can be reused as long as the number of instance descs doesn't change.
+        uint32_t mUVTlasLastBuiltRayCount = 0;                ///< RayTypeCount of the last built TLAS, zero if there is none
 
         /** Describes one BLAS.
         */
@@ -1479,6 +1515,12 @@ namespace Falcor
         bool mBlasDataValid = false;                        ///< Flag to indicate if the BLAS data is valid. This will be reset when geometry is changed.
         bool mRebuildBlas = true;                           ///< Flag to indicate BLASes need to be rebuilt.
 
+        std::vector<ref<RtAccelerationStructure>> mUVBlasObjects; ///< BLAS API objects.
+        std::vector<BlasData> mUVBlasData;                    ///< All data related to the scene's BLASes.
+        std::vector<BlasGroup> mUVBlasGroups;                 ///< BLAS group data.
+        ref<Buffer> mpUVBlasScratch;                          ///< Scratch buffer used for BLAS builds.
+        ref<Buffer> mpUVBlasStaticWorldMatrices;              ///< Object-to-world transform matrices in row-major format. Only valid for static meshes.
+
         std::vector<std::filesystem::path> mImportPaths;    ///< Vector of paths to assets loaded to create scene.
         std::vector<SceneData::ImportDict> mImportDicts;    ///< Vector of dictionaries associated with each asset loaded to create scene.
         bool mFinalized = false;                            ///< True if scene is ready to be bound to the GPU.
@@ -1486,8 +1528,19 @@ namespace Falcor
         /// Used for very large scenes
         SplitIndexBuffer mMeshIndexData;
         SplitVertexBuffer mMeshStaticData;
+        SplitVertexBuffer mMeshUVStaticData;
 
         UpdateFlagsSignal mUpdateFlagsSignal;
+
+        // LoD information
+        std::unordered_map<std::string, int> mLoDNameToIndex;            ///< LoD metadata for meshes in the scene.
+        std::vector<int> mLoDLevels;                                     ///< Current LoD level for each mesh in the scene.
+        std::vector<int> mInstanceIDToLoDIndex;                          ///< Current LoD level for each geometry instance in the scene.
+        bool mIsLoDChanged = false;                                      ///< Flag indicating if any LoD levels have changed this frame.
+        ref<Buffer> mpLoDLevelsBuffer;
+        ref<Buffer> mpPrevLoDLevelsBuffer;                         ///< GPU buffer for previous frame LoD levels.
+
+        ref<Buffer> mpInstanceIDToLoDIndexBuffer;            ///< GPU buffer for instance ID to LoD level mapping.
     public:
         SplitVertexBuffer& getMeshStaticData()
         {

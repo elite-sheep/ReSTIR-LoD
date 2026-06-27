@@ -3,6 +3,8 @@
 
 # Test output folder.
 /tests/data/
+/results/
+/scenes/
 
 # Media folders.
 /media

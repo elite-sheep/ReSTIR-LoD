@@ -38,6 +38,7 @@ struct CameraManager {
     static const uint kCameraKeyframes = NUM_CAMERA_SAMPLES;
     float3 cameraPositions[kCameraKeyframes];
     float3 cameraTargets[kCameraKeyframes];
+    float cameraFocalDistances[kCameraKeyframes];
 
     /**
      * Set the correct camera vectors according to the rotation matrix.
@@ -99,11 +100,14 @@ struct CameraManager {
 
         float3 firstCameraPosition = cameraPositions[firstCameraIndex];
         float3 firstCameraTarget = cameraTargets[firstCameraIndex];
+        float firstCameraFocalDistance = cameraFocalDistances[firstCameraIndex];
         float3 secondCameraPosition = cameraPositions[secondCameraIndex];
         float3 secondCameraTarget = cameraTargets[secondCameraIndex];
+        float secondCameraFocalDistance = cameraFocalDistances[secondCameraIndex];
 
-        camera.data.up = float3(0.0f, 1.0f, 0.0f);
+        // camera.data.up = float3(0.0f, 1.0f, 0.0f);
         camera.data.posW = lerp(secondCameraPosition, firstCameraPosition, t);
+        camera.data.focalDistance = lerp(secondCameraFocalDistance, firstCameraFocalDistance, t);
         float3 firstForward = normalize(firstCameraTarget - firstCameraPosition);
         float3 secondForward = normalize(secondCameraTarget - secondCameraPosition);
         float3 interpolatedForward = angularLerp(firstForward, secondForward, t);

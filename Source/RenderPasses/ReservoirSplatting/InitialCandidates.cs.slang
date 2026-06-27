@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
 
@@ -55,21 +55,24 @@ struct InitialCandidates
         const uint32_t reservoirIdx = params.linearizePixel(path.getPixel());
 
         // If this is the first sample, we initialize an empty PathReservoir.
-        PathReservoir existingReservoir = isFirstSample ? PathReservoir() : currReservoirs[reservoirIdx]; 
+        PathReservoir existingReservoir = isFirstSample ? PathReservoir() : currReservoirs[reservoirIdx];
         bool selected = existingReservoir.add(path.sg, 1.0f / float(kSamplesPerPixel), path.reservoir); // All samples are IID, so m_i = 1 / M.
         existingReservoir.subPixel = selected ? path.reconnection.subPixel : existingReservoir.subPixel;
         existingReservoir.confidence = 1.0f;
         currReservoirs[reservoirIdx] = existingReservoir;
 
         // If this is the first sample, also use a placeholder ReconnectionData.
-        ReconnectionData existingReconnection = isFirstSample ? ReconnectionData() : currReconnectionData[reservoirIdx]; 
+        ReconnectionData existingReconnection = isFirstSample ? ReconnectionData() : currReconnectionData[reservoirIdx];
         currReconnectionData[reservoirIdx] = selected ? path.reservoir.selectedReconnection : existingReconnection;
 
-        print("Path Reservoir Selected", selected);
-        print("Existing Reservoir Integrand", existingReservoir.integrand);
-        print("Existing Reservoir PHat", luminance(existingReservoir.integrand));
-        print("Existing Reservoir Total Weight", existingReservoir.totalWeight);
-        print("Existing Reservoir UCW", existingReservoir.computeUCW());
+        print("reservoirIdx", reservoirIdx);
+        print("pathLength:", currReconnectionData[reservoirIdx].pathLength);
+
+        // print("Path Reservoir Selected", selected);
+        // print("Existing Reservoir Integrand", existingReservoir.integrand);
+        // print("Existing Reservoir PHat", luminance(existingReservoir.integrand));
+        // print("Existing Reservoir Total Weight", existingReservoir.totalWeight);
+        // print("Existing Reservoir UCW", existingReservoir.computeUCW());
         // print("Existing Reservoir Color", existingReservoir.integrand * existingReservoir.computeUCW());
         // print("Size of Path", sizeof(PathState));
     }

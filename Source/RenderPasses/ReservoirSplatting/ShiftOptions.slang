@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #pragma once
 #include "Utils/HostDeviceShared.slangh"
 
@@ -37,15 +37,17 @@ enum class TemporalReuse : uint32_t
     ScatterOnly = 1,   ///< Scatter reuse only.
     ScatterBackup = 2, ///< Scatter + backup.
     MultiScatter = 3,  ///< Scatter into multiple time partitions.
+    RandomReplay = 4,  ///< Random replay.
 };
 
 FALCOR_ENUM_INFO(
     TemporalReuse,
     {
-        { TemporalReuse::GatherOnly, "GatherOnly" },
-        { TemporalReuse::ScatterOnly, "ScatterOnly" },
-        { TemporalReuse::ScatterBackup, "ScatterBackup" },
-        { TemporalReuse::MultiScatter, "MultiScatter" },
+      { TemporalReuse::GatherOnly, "GatherOnly" },
+      { TemporalReuse::ScatterOnly, "ScatterOnly" },
+      { TemporalReuse::ScatterBackup, "ScatterBackup" },
+      { TemporalReuse::MultiScatter, "MultiScatter" },
+      { TemporalReuse::RandomReplay, "RandomReplay" },
     }
 );
 FALCOR_ENUM_REGISTER(TemporalReuse);
@@ -53,7 +55,7 @@ FALCOR_ENUM_REGISTER(TemporalReuse);
 enum class ScatterBackupMIS : uint32_t
 {
     Balance = 0,    ///< Generalized balance heuristic.
-    Pairwise = 1,   ///< Pairwise. 
+    Pairwise = 1,   ///< Pairwise.
 };
 
 FALCOR_ENUM_INFO(

@@ -329,6 +329,8 @@ target_sources(Falcor PRIVATE
     Scene/Intersection.slang
     Scene/IScene.cpp
     Scene/IScene.h
+    Scene/LoDUtils.cpp
+    Scene/LoDUtils.h
     Scene/MeshIO.cs.slang
     Scene/NullTrace.cs.slang
     Scene/Raster.slang

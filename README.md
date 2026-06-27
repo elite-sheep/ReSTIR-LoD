@@ -1,73 +1,83 @@
-# Reservoir Splatting
+# ReSTIR LoD
 
-![](docs/images/reservoir-splatting.png)
+This repository contains the implementation of *"Real-Time Level-of-Detail Rendering with ReSTIR"* by Yu-Chen Wang, Markus Kettunen, Daqi Lin, Chris Wyman, Lifan Wu, and Shuang Zhao. Built on NVIDIA's [Falcor 8.0](https://github.com/NVIDIAGameWorks/Falcor) framework and the [Reservoir Splatting](README_falcor.md) codebase, our method couples ReSTIR temporal path resampling with dynamic level-of-detail (LoD) selection, allocating geometric detail where it matters while keeping temporal reuse stable across LoD transitions.
 
-## Overview
+## Major changes
 
-This repository contains the code for the SIGGRAPH 2025 paper:
+The ReSTIR LoD algorithm is implemented in the `Source/RenderPasses/ReservoirSplatting/` render pass. Relative to the base Reservoir Splatting codebase, the core changes live in two shader files:
 
-> **Reservoir Splatting for Temporal Path Resampling and Motion Blur**<br>
-> Jeffrey Liu (University of Illinois Urbana-Champaign), Daqi Lin (NVIDIA), Markus Kettunen (NVIDIA), Chris Wyman (NVIDIA), Ravi Ramamoorthi (NVIDIA and University of California San Diego)
+- `ShiftMapping.slang` — adds an LoD-aware reconnection shift (`geometricLoDShift`) that re-maps the reconnection vertex through texture UVs when an object's LoD level changes between frames, keeping the shift valid across LoD transitions.
+- `ScatterTemporalResampling.cs.slang` — performs scatter-based temporal reuse across LoD transitions, splatting reservoirs from the prior frame onto the current frame's geometry.
 
-The code is implemented as a standalone ReSTIR path tracer on top of the Falcor 8.0 framework [[Kallweit et al. 2022]](https://github.com/NVIDIAGameWorks/Falcor). Reservoir splatting is an extension of GRIS [[Lin et al. 2022]](https://research.nvidia.com/publication/2022-07_generalized-resampled-importance-sampling-foundations-restir) and Area ReSTIR [[Zhang et al. 2024]](https://graphics.cs.utah.edu/research/projects/area-restir/), which forward-reprojects primary hits from the prior frame to the current frame. This preserves *exact* primary hits across frames, which generally improves the robustness of temporal resampling.
+### Python driver scripts
 
-- All relevant code can be found in the ``Source/RenderPasses/ReservoirSplatting`` render pass.
-- The script ``scripts/ReservoirSplatting.py`` can be used to set up the render graph.
-- Falcor loads the ``pyscene`` format, which can import different scene formats.
-  - Check out ``media/test_scenes/cornell_box.pyscene`` for a simple scene, but fancier scenes can be imported through [Benedikt's rendering resources](https://benedikt-bitterli.me/resources/) or [pbrt-v4's scenes](https://github.com/mmp/pbrt-v4-scenes)!
-  - This implementation uses the reconnection shift after the primary hit, so delta materials are not supported. Refer to the GRIS paper [[Lin et al. 2022]](https://research.nvidia.com/publication/2022-07_generalized-resampled-importance-sampling-foundations-restir) or the ReSTIR Course Notes [[Wyman et al. 2023]](https://intro-to-restir.cwyman.org/) for more details on different ReSTIR shift mappings.
+The `python/` directory holds the headless experiment infrastructure that drives the render pass through Falcor's Python bindings (`falcor.Testbed`). It is organized into shared modules and per-scene render scripts.
 
-Note that most of the reservoir splatting code has not been thoroughly optimized. Contributions are welcome!
+Shared modules:
 
-## Cloning and Building
+- `config.py` — the `RenderConfig` dataclass capturing all run parameters (scene path, bounce count, temporal/spatial flags, temporal-reuse option, resolution, iteration/sample counts, output directory).
+- `common.py` — headless setup helpers: `create_testbed()` builds a windowless Falcor instance; `load_scene()` loads a `.pyscene` with the `DontMergeMaterials | RTDontMergeDynamic | DontOptimizeMaterials` flags so per-object LoD geometry is preserved; `create_render_pass()` wires the `VBufferRT → ReservoirSplatting → AccumulatePass` render graph.
+- `lod_utils.py` — LoD geometry helpers: `min/max_distance_to_bound()` for camera-to-bounds distances and `get_lod_mesh_bounds()`, which looks up a mesh's bounding box by the `{name}_LoD_0` naming convention.
 
-Make sure to clone the repository with its required submodules:
+Per-scene render scripts (`render_*.py`, e.g. `render_Chessboard.py`) each implement the same flow:
+
+1. `determine_lod_by_coc(coc)` — maps a circle-of-confusion value to an LoD level using scene-specific thresholds.
+2. `determine_lod_level(camera, bounds)` — computes the CoC from the camera's focal length, aperture, and focal distance together with the distance to a mesh's bounds, then selects the LoD level.
+3. `render()` — warms up, then runs the main loop: render each frame, save it as EXR, advance the camera (here, the focus-pull animation that changes the focal distance), and raise/lower each object's LoD via `scene.set_lod_level()` / `scene.raise_lod_level()` / `scene.lower_lod_level()`.
+4. `render_gt()` — renders a high-sample-count reference along the same camera path for error comparison.
+
+Scripts are invoked through `argparse` subcommands (`render`, `gt`, `pt`), each taking a `--config_file` YAML; see [Running an example](#running-an-example) below.
+
+## Running an example
+
+We provide the **Chessboard** example, which renders a focus-pull sequence: the camera's focal distance is animated over time, changing the depth-of-field blur and driving the dynamic LoD selection. The rendering scripts live under `python/`.
+
+### 1. Build the project
+
+Build Falcor first (see [Falcor's documentation](https://github.com/NVIDIAGameWorks/Falcor/blob/master/README.md)) so that `Mogwai` and the Python bindings are available. Always rebuild after any shader change.
+
+### 2. Configure the run
+
+The run is controlled by a YAML config. A ready-made one is at [`results/Chessboard/ours.yaml`](results/Chessboard/ours.yaml):
+
+```yaml
+enable_temporal: true
+enable_spatial:  true
+temporal_reuse_option: 'ScatterOnly'
+scene_path: 'C:\path\to\Reservoir-Splatting\scenes\Chessboard\scene.pyscene'
+max_bounces: 1
+output_dir: './ours/'
+num_iters: 180          # number of frames in the focus-pull sequence
+num_images: 1           # samples accumulated per frame
+resolution: [1920, 1080]
+```
+
+Update `scene_path` to point to `scenes/Chessboard/scene.pyscene` on your machine. Output EXR frames are written to `output_dir`, resolved relative to the directory containing the config file.
+
+### 3. Render
+
+From the `python/` directory, run the `render` subcommand inside the Python environment that has Falcor's bindings installed. This animates the camera's focal distance (the depth-of-field change) and adjusts each object's LoD level from the resulting circle-of-confusion as it goes:
 
 ```
-git clone --recursive https://github.com/Jebbly/Reservoir-Splatting.git
+python render_Chessboard.py render --config_file ../results/Chessboard/ours.yaml
 ```
 
-For hardware / software prerequisites and instructions on how to build Falcor, check out [Falcor's documentation](https://github.com/NVIDIAGameWorks/Falcor/blob/master/README.md). 
+This writes one EXR per frame (`img_0.exr`, `img_1.exr`, …) into the output directory and prints the average FPS when finished.
 
-## Running
+To render a high-sample-count reference for comparison, use the `gt` subcommand instead, which follows the same focus-pull path and accumulates many samples at a single frame:
 
-After building and running Mogwai, run the script in ``scripts/ReservoirSplatting.py`` to set up the reservoir splatting render graph.
+```
+python render_Chessboard.py gt --config_file ../results/Chessboard/gt.yaml
+```
 
-### Camera Options
-
-Depth of field and motion blur depend on the camera settings. When a scene is loaded, these can be enabled through ``Scene Settings -> Camera``:
-- A non-zero aperture radius will enable depth of field.
-- A non-zero shutter speed will enable motion blur.
-  - Since actual frame rate is variable, we use an artificial time between frames to compute motion blur. For example, if the shutter speed is set to 1/24 s and the artificial frame time is 1/48 s, motion blur is computed across half the frame time (even if the actual frame took less time to render).
-  - You can change the simulated time between frames (defaults to 60 FPS) under ``ReservoirSplatting -> Rendering Options -> Simulated Frame Time``. 
-
-### Temporal Resampling Options
-
-The script defaults to splat-only temporal resampling, but different options can be enabled through the UI or by modifying the script. In the UI, under ``ReservoirSplatting -> ReSTIR Options -> Temporal Resampling``, the following temporal resampling options are supported:
-
-- ``GatherOnly`` is our (un-optimized) reimplementation of Area ReSTIR [[Zhang et al. 2024]](https://graphics.cs.utah.edu/research/projects/area-restir/). 
-  - ``Fast`` and ``Robust`` are the two options presented in Area ReSTIR, while ``Clamped`` uses integer motion vectors.
-  - The robust reuse optimization is enabled by default, when the ``Robust`` option is selected.
-  - If the camera has a non-zero aperture radius, both the lens vertex copy and the primary hit reconnection are used.
-- ``ScatterOnly`` is our single-splat implementation.
-- ``ScatterBackup`` is our splat + backup implementation.
-  - Our results use ``Clamped`` as the gather method and ``Balance`` as the MIS weighting scheme.
-- ``MultiSplatting`` is our multi-splat implementation.
-  - This option is only available when the camera has a non-zero shutter speed.
-  - If the partition count is set too high, your GPU may run out of memory. 
-
-### Utility Options
-
-We provide a set of utility in the UI for debugging and/or capturing output.
-
-- Using ``Scene Settings -> Freeze``, you can pause at your current frame and preserve the temporal history from the previous frame.
-  - This is helpful for debugging / capturing under motion. 
-  - A reference image under motion can be captured by disabling all ReSTIR options and enabling the ``AccumulationPass``. This is used for motion blurred reference images.
-- Using ``Scene Settings -> User Interaction``:
-  - You can record the camera motion to a text file, and then replay the same motion from the output text file.
-  - By default with ``Freeze Frame ID`` set to -1, the recorded motion will loop. 
-  - Setting ``Freeze Frame ID`` to a value greater than -1 will freeze the frame at the specified frame ID.
-    - Unfreeze to continue playing the motion!
-    - If ``Replay for Accumulation`` is enabled, the frame will no longer freeze but will instead contribute to the ``AccumulationPass``. Enable ``View Accumulated Image`` and ``AccumulatePass -> Enabled`` to view the accumulation under motion, at the specified frame ID. This is useful for verifying unbiasedness under motion, but note that this is a *very slow* process since it effectively replays the entire motion sequence for one accumulated sample. 
-- Use the ``FrameDumper`` pass at the end to output every frame, which can be used to generate a video.
-  - Warning: disable ``Save PNG Files`` for better performance, and use FFMPEG to composite the output pixel maps.
+## Citation
+If you use this codebase, or your work is based on this project, please cite our paper:
+```
+@inproceedings{Wang:2026:ReSTIR-LoD,
+  title={Real-Time Level-of-Detail Rendering with ReSTIR},
+  author={Wang, Yu-Chen and Kettunen, Markus and Lin, Daqi and Wyman, Chris and Wu, Lifan and Zhao, Shuang},
+  booktitle = {ACM SIGGRAPH 2026 Conference Proceedings},
+  doi = {10.1145/3799902.3811100},
+  year = {2026},
+}
+```

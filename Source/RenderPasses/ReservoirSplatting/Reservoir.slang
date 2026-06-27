@@ -72,7 +72,7 @@ struct CandidateReservoir
 
 struct PathReservoir
 {
-    static const float confidenceCap = 20;
+    static const float confidenceCap = 20.0f;
 
     float confidence;         // Sample history in the reservoir.
     float totalWeight;        // Total weight

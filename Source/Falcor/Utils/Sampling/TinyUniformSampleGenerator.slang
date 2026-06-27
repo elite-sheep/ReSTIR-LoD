@@ -44,11 +44,19 @@ export struct TinyUniformSampleGenerator : ISampleGenerator
         uint3 _pad;
     };
 
+    uint getCount() { return this.sampleCount; }
+
+    [mutating]
+    void setCount(uint newValue) { this.sampleCount = newValue; }
+
     /**
      * Initializes the sample generator.
      * @param[in] seed Seed value.
      */
-    __init(uint seed) { this.rng = createLCG(seed); }
+    __init(uint seed) {
+        this.rng = createLCG(seed);
+        this.sampleCount = 0u;
+    }
 
     /**
      * Initializes the sample generator for a given pixel and sample number.
@@ -60,13 +68,18 @@ export struct TinyUniformSampleGenerator : ISampleGenerator
         // Use block cipher to generate a pseudorandom initial seed.
         uint seed = blockCipherTEA(interleave_32bit(pixel), sampleNumber).x;
         this.rng = createLCG(seed);
+        this.sampleCount = 0u;
     }
 
     /**
      * Returns the next sample value. This function updates the state.
      */
     [mutating]
-    uint next() { return nextRandom(rng); }
+    uint next() {
+        ++this.sampleCount;
+        return nextRandom(rng);
+    }
 
+    uint sampleCount;
     LCG rng; ///< Simple LCG 32-bit pseudorandom number generator.
 };

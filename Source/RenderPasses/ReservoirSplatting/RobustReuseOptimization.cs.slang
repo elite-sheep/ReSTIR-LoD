@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
@@ -81,7 +81,7 @@ struct RobustReuseOptimization
             bool neighborIsValid = params.validateFloatingPixelBounds(float2(neighborPixel));
             bool canShift = any(prevReservoir.integrand > 0.0f);
 
-            ShiftedPathData shiftedPath = (neighborIsValid && canShift) ? gatherLensVertexCopyShift(sg, prevReconnection, prevReconnection.time + gCameraManager.artificialFrameTime, float2(neighborPixel) + prevReservoir.subPixel, prevReconnection.lensSample) 
+            ShiftedPathData shiftedPath = (neighborIsValid && canShift) ? gatherLensVertexCopyShift(sg, prevReconnection, prevReconnection.time + gCameraManager.artificialFrameTime, float2(neighborPixel) + prevReservoir.subPixel, prevReconnection.lensSample)
                                                                         : ShiftedPathData();
 
             shiftedPaths[8 * reservoirIdx + offsetIndex] = shiftedPath;
@@ -98,11 +98,11 @@ cbuffer CB
 // Shader entry point for ray generation shader.
 //
 
-[shader("raygeneration")]
-void rayGen()
+[numthreads(8, 16, 1)]
+void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    uint2 pixel = dispatchThreadID.xy;
+    uint2 frameDim = gRobustReuseOptimization.params.frameDim;
     if (all(pixel >= frameDim)) return;
 
     printSetPixel(pixel);

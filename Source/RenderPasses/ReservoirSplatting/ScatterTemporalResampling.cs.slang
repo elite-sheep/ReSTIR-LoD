@@ -25,11 +25,12 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
 
+import Scene.RaytracingInline;
 import Utils.Color.ColorHelpers;
 import Utils.Debug.PixelDebug;
 
@@ -81,11 +82,33 @@ struct ScatterTemporalResampling
         if (any(currReservoir.integrand > 0.0f))
         {
             float m1 = luminance(currReservoir.integrand) * (useConfidenceWeights ? currReservoir.confidence : 1.0f);
+            HitInfo projectedHit = currReconnection.firstHit;
+            float geometricShiftJacobian = 1.0f;
+            uint lodIndex = gScene.instanceIDToLoDIndex[currReconnection.firstHit.getInstanceID().index];
+            bool isPrevFrame = gScene.isLoDChanged || gScene.isGeometryMoved;
+            bool isEnvMapHit = currReconnection.pathLength == 1 && currReconnection.lightIsDistant;
+            if (gScene.prevLoDLevels[lodIndex] >= 0 &&
+                gScene.loDLevels[lodIndex] != gScene.prevLoDLevels[lodIndex] &&
+                currReconnection.firstHit.isValid() &&
+                !isEnvMapHit)
+            {
+                projectedHit = geometricLoDShift(currReconnection.firstHit, currReconnection.firstTextureUV, geometricShiftJacobian, isPrevFrame);
+            }
 
             // Shift the current sample to the previous frame domain.
             float m2 = 0.0f;
-            ShiftedPathData shiftedCurr = scatterReprojectionShift(sg, currReconnection, currReconnection.time + gCameraManager.artificialFrameTime, currReconnection.firstHit, currReconnection.lensSample);
-            float shiftedJacobian = (shiftedCurr.subPixelJacobian * shiftedCurr.secondaryPathJacobian) / (currReconnection.subPixelJacobian * currReconnection.secondaryPathJacobian);
+            print("isPrevFrame", isPrevFrame);
+            ShiftedPathData shiftedCurr = scatterReprojectionShift(sg,
+                                                                   currReconnection,
+                                                                   currReconnection.time + gCameraManager.artificialFrameTime,
+                                                                   projectedHit,
+                                                                   currReconnection.lensSample, false, isPrevFrame, gScene.isGeometryMoved);
+            float shiftedJacobian = (geometricShiftJacobian * shiftedCurr.secondHitGeometricJacobian * shiftedCurr.subPixelJacobian * shiftedCurr.secondaryPathJacobian) / (currReconnection.subPixelJacobian * currReconnection.secondaryPathJacobian);
+
+            // ReconnectionData testReconnection = currReconnection;
+            // testReconnection.update(shiftedCurr);
+            // ShiftedPathData verifyShift = scatterReprojectionShift(sg, testReconnection, currReconnection.time + gCameraManager.artificialFrameTime, currReconnection.firstHit, currReconnection.lensSample);
+            // print("verifyShift.radiance", verifyShift.radiance);
             m2 = luminance(shiftedCurr.radiance) * shiftedJacobian;
             m2 = isnan(m2) ? 0.0f : m2;
 
@@ -101,6 +124,7 @@ struct ScatterTemporalResampling
             }
 
             currSampleMIS = (m1 + m2 == 0.0f) ? 0.0f : m1 / (m1 + m2);
+            print("Current Sample MIS", currSampleMIS);
         }
 
         bool currSelected = dstReservoir.addSampleFromReservoir(sg, currSampleMIS, currReservoir.integrand, 1.0f, currReservoir);
@@ -126,22 +150,34 @@ struct ScatterTemporalResampling
             float shiftedJacobian = 1.0f;
             if (any(prevReservoir.integrand > 0.0f))
             {
-                ShiftedPathData shiftedPrev = scatterReprojectionShift(sg, prevReconnection, prevReconnection.time, prevReconnection.firstHit, prevReconnection.lensSample);
-                shiftedJacobian = (shiftedPrev.subPixelJacobian * shiftedPrev.secondaryPathJacobian) / (prevReconnection.subPixelJacobian * prevReconnection.secondaryPathJacobian);
-                float m1 = luminance(shiftedPrev.radiance) * shiftedJacobian * (useConfidenceWeights ? currReservoir.confidence : 1.0f);
-                prevPHat = isnan(m1) ? float3(0.0f, 0.0f, 0.0f) : shiftedPrev.radiance;
-                shiftedJacobian = isnan(m1) ? 1.0f : shiftedJacobian; // W_{y_i} = W_{x_i} * |T(x)|
+                HitInfo projectedHit = prevReconnection.firstHit;
+                float geometricShiftJacobian = 1.0f;
+                uint lodIndex = gScene.instanceIDToLoDIndex[prevReconnection.firstHit.getInstanceID().index];
+                bool isEnvMapHit = prevReconnection.pathLength == 1 && prevReconnection.lightIsDistant;
+                if (gScene.loDLevels[lodIndex] >= 0 &&
+                    gScene.loDLevels[lodIndex] != gScene.prevLoDLevels[lodIndex] &&
+                    prevReconnection.firstHit.isValid() &&
+                    !isEnvMapHit)
+                {
+                    projectedHit = geometricLoDShift(prevReconnection.firstHit, prevReconnection.firstTextureUV, geometricShiftJacobian, false);
+                }
 
-                // Update the relevant data.
-                prevReconnection.update(shiftedPrev);
-
-                // The scattered reservoir will also be at a new subpixel location, compared to where it originally started.
-                prevReservoir.setSubPixel(prevReconnection.subPixel);
+                float m1;
                 float m2 = luminance(prevReservoir.integrand) * (useConfidenceWeights ? prevReservoir.confidence : 1.0f);
+                {
+                    ShiftedPathData shiftedPrev = scatterReprojectionShift(sg, prevReconnection, prevReconnection.time, projectedHit, prevReconnection.lensSample);
+                    shiftedJacobian = (geometricShiftJacobian * shiftedPrev.secondHitGeometricJacobian * shiftedPrev.subPixelJacobian * shiftedPrev.secondaryPathJacobian) / (prevReconnection.subPixelJacobian * prevReconnection.secondaryPathJacobian);
+                    shiftedJacobian = isnan(shiftedJacobian) ? 0.0f : shiftedJacobian;
+                    m1 = luminance(shiftedPrev.radiance) * shiftedJacobian * (useConfidenceWeights ? currReservoir.confidence : 1.0f);
+                    prevPHat = isnan(m1) ? float3(0.0f, 0.0f, 0.0f) : shiftedPrev.radiance;
+                    shiftedJacobian = isnan(m1) ? 1.0f : shiftedJacobian;
 
+                    prevReconnection.update(shiftedPrev);
+                    prevReservoir.setSubPixel(prevReconnection.subPixel);
+                }
                 prevSampleMIS = ((m1 + m2) == 0.0f) ? 0.0f : m2 / (m1 + m2);
             }
-            
+
             print("Previous Sample MIS", prevSampleMIS);
             bool prevSelected = dstReservoir.addSampleFromReservoir(sg, prevSampleMIS, prevPHat, shiftedJacobian, prevReservoir);
             dstReconnectionData = prevSelected ? prevReconnection : dstReconnectionData;
@@ -183,11 +219,11 @@ cbuffer CB
 // Shader entry point for ray generation shader.
 //
 
-[shader("raygeneration")]
-void rayGen()
+[numthreads(8, 16, 1)]
+void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    uint2 pixel = dispatchThreadId.xy;
+    uint2 frameDim = gScatterTemporalResampling.params.frameDim;
     if (all(pixel >= frameDim)) return;
 
     printSetPixel(pixel);

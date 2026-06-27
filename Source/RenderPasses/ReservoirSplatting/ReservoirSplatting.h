@@ -116,6 +116,8 @@ private:
     void scatterTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData);
     void multiScatterTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData);
     void scatterBackupTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData);
+    void randomReplayTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData);
+    void randomReplayTemporalSamples(RenderContext* pRenderContext, const RenderData& renderData);
     void spatialResampling(RenderContext* pRenderContext, const RenderData& renderData);
     void resolveReSTIR(RenderContext* pRenderContext, const RenderData& renderData);
 
@@ -131,14 +133,11 @@ private:
         uint32_t    maxTransmissionBounces = 9;                 ///< Max number of transmission bounces (0 = none), up to kMaxBounces.
 
         // Sampling parameters
-        uint32_t    sampleGenerator = SAMPLE_GENERATOR_TINY_UNIFORM; ///< Pseudorandom sample generator type.
-        bool        useBSDFSampling = true;                     ///< Use BRDF importance sampling, otherwise cosine-weighted hemisphere sampling.
-        bool        useRussianRoulette = true;                  ///< Use russian roulette to terminate low throughput paths.
-        bool        useNEE = true;                              ///< Use next-event estimation (NEE). This enables shadow ray(s) from each path vertex.
-        bool        useMIS = true;                              ///< Use multiple importance sampling (MIS) when NEE is enabled.
-        MISHeuristic misHeuristic = MISHeuristic::Balance;      ///< MIS heuristic.
-        float       misPowerExponent = 2.f;                     ///< MIS exponent for the power heuristic. This is only used when 'PowerExp' is chosen.
-        EmissiveLightSamplerType emissiveSampler = EmissiveLightSamplerType::Power;  ///< Emissive light sampler to use for NEE. The LightBVH is (potentially) position dependent, so it should be avoided.
+        uint32_t    sampleGenerator = SAMPLE_GENERATOR_TINY_UNIFORM;                ///< Pseudorandom sample generator type.
+        bool        useRussianRoulette = true;                                      ///< Use russian roulette to terminate low throughput paths.
+        MISHeuristic misHeuristic = MISHeuristic::Balance;                          ///< MIS heuristic.
+        float       misPowerExponent = 2.f;                                         ///< MIS exponent for the power heuristic. This is only used when 'PowerExp' is chosen.
+        EmissiveLightSamplerType emissiveSampler = EmissiveLightSamplerType::Power; ///< Emissive light sampler to use for NEE. The LightBVH is (potentially) position dependent, so it should be avoided.
 
         // Material parameters
         bool        useAlphaTest = true;                        ///< Use alpha testing on non-opaque triangles.
@@ -162,7 +161,7 @@ private:
         float artificialFrameTime = 1.0f / 60.0f;   ///< Artificial frame time between the two camera points.
 
         // Free camera motion parameters.
-        int currNumKeyframes = 1;                   ///< Number of camera samples that need to be kept track of.
+        int currNumKeyframes = 8;                   ///< Number of camera samples that need to be kept track of.
         int prevNumKeyframes = 0;                   ///< The previous number of camera samples used, in case we need to recompile the shader.
     };
 
@@ -181,8 +180,8 @@ private:
         // Spatial resampling parameters.
         bool enableSpatialResampling = true;                                    ///< Toggle to use spatial resampling.
         uint32_t numSpatialIterations = 1;                                      ///< Number of spatial resampling iterations.
-        float spatialGatherRadius = 30.0f;                                      ///< Radius for spatial reuse.
-        uint32_t neighborCount = 1;                                             ///< Number of neighbors to consider for spatial resampling (for a given iteration).
+        float spatialGatherRadius = 32.0f;                                      ///< Radius for spatial reuse.
+        uint32_t neighborCount = 2;                                             ///< Number of neighbors to consider for spatial resampling (for a given iteration).
         bool useConfidenceWeightsSpatially = true;                              ///< Toggle for using confidence weights during spatial resampling.
     };
 
@@ -218,19 +217,21 @@ private:
 
     // ReSTIR passes
     ref<ComputePass>                mpInitialCandidatesPass;                    ///< Initial candidate generation pass.
-    std::unique_ptr<TracePass>      mpRobustReuseOptimizationPass;              ///< Robust re-use optimization pass.
+    ref<ComputePass>                mpRobustReuseOptimizationPass;              ///< Robust re-use optimization pass.
     ref<ComputePass>                mpCollectTemporalSamplesPass;               ///< Collect temporal samples pass.
-    std::unique_ptr<TracePass>      mpReprojectTemporalSamplesPass;             ///< Scatter temporal samples pass.
-    std::unique_ptr<TracePass>      mpMultiReprojectTemporalSamplesPass;        ///< Multi-scatter temporal samples pass.
+    ref<ComputePass>                mpReprojectTemporalSamplesPass;             ///< Scatter temporal samples pass.
+    ref<ComputePass>                mpMultiReprojectTemporalSamplesPass;        ///< Multi-scatter temporal samples pass.
     ref<ComputePass>                mpComputeCellOffsetsPass;                   ///< Compute cell offsets pass.
     ref<ComputePass>                mpSortCellDataPass;                         ///< Sort cell data pass.
     ref<ComputePass>                mpMultiComputeCellOffsetsPass;              ///< (Multi) compute cell offsets pass.
     ref<ComputePass>                mpMultiSortCellDataPass;                    ///< (Multi) sort cell data pass.
-    std::unique_ptr<TracePass>      mpGatherTemporalResamplingPass;             ///< Gather-only temporal resampling pass.
-    std::unique_ptr<TracePass>      mpScatterTemporalResamplingPass;            ///< Scatter-only temporal resampling pass.
-    std::unique_ptr<TracePass>      mpMultiScatterTemporalResamplingPass;       ///< Multi-scatter temporal resampling pass.
-    std::unique_ptr<TracePass>      mpScatterBackupTemporalResamplingPass;      ///< Scatter + backup temporal resampling.
-    std::unique_ptr<TracePass>      mpSpatialResamplingPass;                    ///< Spatial resampling pass.
+    ref<ComputePass>                mpGatherTemporalResamplingPass;             ///< Gather-only temporal resampling pass.
+    ref<ComputePass>                mpScatterTemporalResamplingPass;            ///< Scatter-only temporal resampling pass.
+    ref<ComputePass>                mpMultiScatterTemporalResamplingPass;       ///< Multi-scatter temporal resampling pass.
+    ref<ComputePass>                mpScatterBackupTemporalResamplingPass;      ///< Scatter + backup temporal resampling.
+    ref<ComputePass>                mpRandomReplayTemporalResamplingPass;       ///< Random-replay temporal resampling pass.
+    ref<ComputePass>                mpRandomReplayTemporalSamplesPass;          ///< Random-replay temporal samples generation pass.
+    ref<ComputePass>                mpSpatialResamplingPass;                    ///< Spatial resampling pass.
     ref<ComputePass>                mpResolveReSTIRPass;                        ///< Resolve ReSTIR pass.
 
     // Visualization passes
@@ -265,7 +266,7 @@ private:
     std::vector<ref<Buffer>>        mMultiSortedReservoirs;                 ///> Linearized, sorted buffer of all reservoirs.
 
     // Temporal scatter visualization
-    bool                            mDumpScatterCount = false;              ///< Dump the scatter count on next run. 
+    bool                            mDumpScatterCount = false;              ///< Dump the scatter count on next run.
     std::string                     mScatterDumpDir = "c:/scatterCount/";   ///< Directory to output the scatter counts.
     std::string                     mScatterDumpFile = "dump.txt";          ///< File to output the scatter counts.
     ref<Fence>                      mpReadbackFence;                        ///< Readback fence for staging.

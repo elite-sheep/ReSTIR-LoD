@@ -498,3 +498,14 @@ HitInfo unpackHitInfo(PackedHitInfo packedHitInfo)
 {
     return HitInfo(packedHitInfo);
 }
+
+struct UVHitInfo
+{
+    HitInfo hits[8];
+    int count;
+
+    __init()
+    {
+        count = 0;
+    }
+};

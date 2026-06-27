@@ -67,7 +67,7 @@ void computeDerivativesAtPrimaryTriangleHit(const TriangleHit hit, uint2 pixel, 
     \param[out] materialID Material ID.
     \return VertexData struct.
 */
-VertexData loadVertexData(const HitInfo hit, const float3 rayOrigin, const float3 rayDir, out uint materialID)
+VertexData loadVertexData(const HitInfo hit, const float3 rayOrigin, const float3 rayDir, out uint materialID, bool isPrevFrame = false)
 {
     VertexData v = {};
     materialID = {};
@@ -77,7 +77,19 @@ VertexData loadVertexData(const HitInfo hit, const float3 rayOrigin, const float
     {
         const TriangleHit triangleHit = hit.getTriangleHit();
         StaticVertexData vertices[3];
-        v = gScene.getVertexData(triangleHit, vertices);
+        if (isPrevFrame)
+        {
+            const uint3 vtxIndices = gScene.getIndices(triangleHit.instanceID, triangleHit.primitiveIndex);
+            vertices = { gScene.getVertex(vtxIndices[0]), gScene.getVertex(vtxIndices[1]), gScene.getVertex(vtxIndices[2]) };
+            const float4x4 worldMat = gScene.getPrevWorldMatrix(triangleHit.instanceID);
+            const float3x3 worldInvTransposeMat = gScene.getPrevInverseTransposeWorldMatrix(triangleHit.instanceID);
+            const bool isFrontFaceCW = gScene.isObjectFrontFaceCW(triangleHit.instanceID);
+            v = gScene.computeVertexData(vertices, worldMat, worldInvTransposeMat, isFrontFaceCW, triangleHit.getBarycentricWeights());
+        }
+        else
+        {
+            v = gScene.getVertexData(triangleHit, vertices);
+        }
         materialID = gScene.getMaterialID(triangleHit.instanceID);
     }
 #endif
@@ -131,11 +143,11 @@ uint getMaterialInstanceHints(const HitInfo hit, const bool isPrimary)
     \param[in] lod Method for computing texture level-of-detail
     \return ShadingData struct.
 */
-ShadingData loadShadingData(const HitInfo hit, const float3 rayOrigin, const float3 rayDir)
+ShadingData loadShadingData(const HitInfo hit, const float3 rayOrigin, const float3 rayDir, bool isPrevFrame = false)
 {
     uint materialID = {};
 
-    VertexData v = loadVertexData(hit, rayOrigin, rayDir, materialID);
+    VertexData v = loadVertexData(hit, rayOrigin, rayDir, materialID, isPrevFrame);
     ShadingData sd = gScene.materials.prepareShadingData(v, materialID, -rayDir);
 
     return sd;

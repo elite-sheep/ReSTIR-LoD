@@ -37,13 +37,19 @@ struct ShiftedPathData
     // TODO: technically, the scatter / gather shift only ever needs one of the two here,
     // but both are stored here for simplicity.
     HitInfo primaryHit;
+    float2 primaryHitUV; // Store the UVs at the primary hit for scatter-based shifting.
     float2 fractionalPixel;
+
+    HitInfo secondHit;
+    float2 secondHitUV; // Store the UVs at the second hit for gather-based shifting.
+    float secondHitGeometricJacobian; // The geometric Jacobian of the second hit (for gather-based shifting).
 
     float2 lensSample;  // This is sometimes used for Area ReSTIR DoF.
     float3 firstRayDir; // This is sometimes used for environment maps.
 
     // Track all the Jacobian footprints used for all the shifts.
     float subPixelJacobian; // The reprojection (splatting) shift changes the subpixel location.
+    float firstHitJacobian; // The primary hit reconnection shift changes the primary hit.
     float lensVertexJacobian; // The primary hit reconnection shift changes the lens vertex.
     float secondaryPathJacobian; // The path reconnection shift modifies the path density.
 
@@ -53,19 +59,33 @@ struct ShiftedPathData
     __init()
     {
         this.primaryHit = HitInfo();
+        this.primaryHitUV = float2(0.0f, 0.0f);
         this.fractionalPixel = float2(-1.0f, -1.0f);
+
+        this.secondHit = HitInfo();
+        this.secondHitUV = float2(0.0f, 0.0f);
+        this.secondHitGeometricJacobian = 1.0f;
 
         this.lensSample = float2(0.0f, 0.0f);
         this.firstRayDir = float3(0.0f, 0.0f, 0.0f);
 
         this.subPixelJacobian = 1.0f;
+        this.firstHitJacobian = 1.0f;
         this.lensVertexJacobian = 1.0f;
         this.secondaryPathJacobian = 1.0f;
 
         this.radiance = float3(0.0f, 0.0f, 0.0f);
     }
 
-    __init(HitInfo initialPrimaryHit, float2 initialFractionalPixel, float2 initialLensSample, float3 initialFirstRayDir, float initialSubPixelJacobian, float initialLensVertexJacobian, float initialSecondaryPathJacobian, float3 initialRadiance)
+    __init(HitInfo initialPrimaryHit,
+           float2 initialFractionalPixel,
+           float2 initialLensSample,
+           float3 initialFirstRayDir,
+           float initialSubPixelJacobian,
+           float initialFirstHitJacobian,
+           float initialLensVertexJacobian,
+           float initialSecondaryPathJacobian,
+           float3 initialRadiance)
     {
         this.primaryHit = initialPrimaryHit;
         this.fractionalPixel = initialFractionalPixel;
@@ -74,6 +94,7 @@ struct ShiftedPathData
         this.firstRayDir = initialFirstRayDir,
 
         this.subPixelJacobian = initialSubPixelJacobian;
+        this.firstHitJacobian = initialFirstHitJacobian;
         this.lensVertexJacobian = initialLensVertexJacobian;
         this.secondaryPathJacobian = initialSecondaryPathJacobian;
 
@@ -88,9 +109,12 @@ struct ShiftedPathData
 //   3. The second hit is a normal vertex in the path.
 struct ReconnectionData
 {
+    uint3 seed; // RNG for path sampling.
+
     // Some camera / film parameters used generally.
     float2 subPixel;
     float2 lensSample;
+
     float time;
 
     // The only vertex that contributes actual emission is the final vertex,
@@ -98,12 +122,14 @@ struct ReconnectionData
     uint pathLength;
 
     // Information about the first vertex.
-    HitInfo firstHit; // Hit info of the first vertex.
     uint firstBSDFComponentType; // The BSDF component mask of the first hit.
+    HitInfo firstHit; // Hit info of the first vertex.
+    float2  firstTextureUV; // The texture UVs at the first hit.
     float3 firstWi; // The incoming ray direction of the first hit.
 
     // Information about the second vertex.
     HitInfo secondHit; // Hit info of the second vertex.
+    float2 secondTextureUV; // The texture UVs at the second hit.
     uint secondBSDFComponentType; // The BSDF component mask of the second hit.
     float3 secondWo;             // The outgoing ray direction after the second hit.
 
@@ -116,11 +142,13 @@ struct ReconnectionData
     // When the light is the second vertex, this is in area measure. If it's the third vertex, then it's the solid angle measure.
     // But the third vertex / solid angle measure is only really useful for MIS since they cancel out in the Jacobian.
 
-    float subPixelJacobian;       // For scatter-based shifting, this is needed to re-parametrize from primary hit world-space to subpixel coordinate.
+    float subPixelJacobian;         // For scatter-based shifting, this is needed to re-parametrize from primary hit world-space to subpixel coordinate.
+    float firstHitJacobian;         // For scatter-based shifting, this is needed to re-parametrize from UV space to primary hit world-space.
     float lensVertexJacobian;       // For gather-based primary hit reconnection shift, this is needed to re-parametrize from primary hit world-space to lens position.
     float secondaryPathJacobian;    // For the reconnection shift, this is needed to re-parametrize from second hit PSS to solid angle.
     float3 irradiance;      // This gets used for different things depending on which case occurs.
     float3 earlyThroughput; // Throughput past the first/second vertex to reconstruct the total irradiance.
+    uint2 pad;
 
     __init()
     {
@@ -145,6 +173,7 @@ struct ReconnectionData
         this.lightPdf = 0.0f;
 
         this.subPixelJacobian = 1.0f;
+        this.firstHitJacobian = 1.0f;
         this.lensVertexJacobian = 1.0f;
         this.secondaryPathJacobian = 1.0f;
         this.irradiance = float3(0.0f, 0.0f, 0.0f);
@@ -155,11 +184,16 @@ struct ReconnectionData
     void update(ShiftedPathData shiftedPath)
     {
         this.firstHit = shiftedPath.primaryHit;
+        this.firstTextureUV = shiftedPath.primaryHitUV;
         this.subPixel = shiftedPath.fractionalPixel - floor(shiftedPath.fractionalPixel);
         this.lensSample = shiftedPath.lensSample;
         this.firstWi = -shiftedPath.firstRayDir;
-        
+
+        this.secondHit = shiftedPath.secondHit;
+        this.secondTextureUV = shiftedPath.secondHitUV;
+
         this.subPixelJacobian = shiftedPath.subPixelJacobian;
+        this.firstHitJacobian = shiftedPath.firstHitJacobian;
         this.lensVertexJacobian = shiftedPath.lensVertexJacobian;
         this.secondaryPathJacobian = shiftedPath.secondaryPathJacobian;
     }

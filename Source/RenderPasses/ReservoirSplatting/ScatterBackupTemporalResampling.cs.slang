@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
@@ -247,7 +247,7 @@ struct ScatterBackupTemporalResampling
                         float shiftedJacobian = (shiftedPrev.secondaryPathJacobian / prevReconnection.secondaryPathJacobian);
                         m3 = luminance(shiftedPrev.radiance) * shiftedJacobian * scatteredJacobian * 0.5f * (useConfidenceWeights ? backupReservoir.confidence : 1.0f);
                     }
-                    
+
                     // TODO: This check is only necessary if the secondaryPathJacobian ever equals 0... is that ever possible?
                     m3 = isnan(m3) ? 0.0f : m3;
                 }
@@ -292,11 +292,11 @@ cbuffer CB
 // Shader entry point for ray generation shader.
 //
 
-[shader("raygeneration")]
-void rayGen()
+[numthreads(8, 16, 1)]
+void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    uint2 pixel = dispatchThreadID.xy;
+    uint2 frameDim = gScatterBackupTemporalResampling.params.frameDim;
     if (all(pixel >= frameDim)) return;
 
     printSetPixel(pixel);

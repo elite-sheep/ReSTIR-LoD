@@ -277,6 +277,7 @@ namespace Falcor
             bool isAnimated = false;            ///< True if the mesh vertices can be modified during rendering (e.g., skinning or inverse rendering).
             std::vector<uint32_t> indexData;    ///< Vertex indices in either 32-bit or 16-bit format packed tightly, or empty if non-indexed.
             std::vector<StaticVertexData> staticData;
+            std::vector<StaticVertexData> uvStaticData;
             std::vector<SkinningVertexData> skinningData;
         };
 
@@ -708,12 +709,14 @@ namespace Falcor
             bool isFrontFaceCW = false;             ///< Indicate whether front-facing side has clockwise winding in object space.
             bool isDisplaced = false;               ///< True if mesh has displacement map.
             bool isAnimated = false;                ///< True if the mesh vertices can be modified during rendering (e.g., skinning or inverse rendering).
+            bool isLoDMesh = false;                 ///< True if the mesh is a LoD mesh.
             AABB boundingBox;                       ///< Mesh bounding-box in object space.
             std::set<NodeID> instances;             ///< IDs of all nodes that instantiate this mesh.
 
             // Pre-processed vertex data.
             std::vector<uint32_t> indexData;    ///< Vertex indices in either 32-bit or 16-bit format packed tightly, or empty if non-indexed.
             std::vector<StaticVertexData> staticData;
+            std::vector<StaticVertexData> uvStaticData;
             std::vector<SkinningVertexData> skinningData;
 
             uint32_t getTriangleCount() const

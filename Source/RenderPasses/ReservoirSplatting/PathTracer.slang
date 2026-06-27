@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 import Rendering.Lights.EnvMapSampler;
 import Rendering.Lights.EmissiveLightSampler;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
@@ -48,12 +48,20 @@ __exported import Params;
 __exported import CameraManager;
 import Scene.RaytracingInline;
 
+// Samples per hit.
+static const uint kSamplesPerHit = 16u;
+
 // Define ray indices.
 static const uint kRayTypeScatter = 0;
 static const uint kMissScatter = 0;
 
 static const uint kRayTypeShadow = 1;
 static const uint kMissShadow = 1;
+
+// UV ray tracing
+static const float kUVCompressRatio = 0.01f;
+static const float kUVRayEpsilon = 1e-4f;
+static const float kUVRayTMax = 1e-3f;
 
 /** Path tracer.
 
@@ -185,6 +193,50 @@ struct PathTracer
         return surfaceBounces;
     }
 
+    /** Generate the path state for a primary hit in screen space in random replay.
+        This is treated equivalent to subsequent path vertices to reduce code divergence.
+        \param[out] path Path state before the primary hit.
+        \param[in] seed RNG seed.
+        \param[in] pathID Path ID which encodes pixel and sample index.
+    */
+    void generatePathForRandomReplay(out PathState path,
+                                     const uint3 seed,
+                                     const uint pathID,
+                                     const bool isPrevFrame = false)
+    {
+        path = {};
+        path.setActive();
+        path.id = pathID;
+        path.thp = float3(1.f);
+
+        // Create sample generator.
+        const uint2 pixel = path.getPixel();
+        path.sg = SampleGenerator(seed.xy, seed.z);
+        uint init_sample_count = path.sg.getCount();
+
+        // Randomize the camera parameters.
+        Camera camera = gScene.camera;
+        float compensation = isPrevFrame ? gCameraManager.artificialFrameTime : 0.0f;
+        path.reconnection.seed = seed;
+        path.reconnection.time = sampleNext1D(path.sg) * camera.data.shutterSpeed;
+        path.reconnection.subPixel = sampleNext2D(path.sg);
+        path.reconnection.lensSample = (camera.data.apertureRadius > 0.0f) ? sample_disk(sampleNext2D(path.sg)) : float2(0.0f, 0.0f);
+
+        // Spawn the primary ray based on the camera orientation.
+        gCameraManager.orientCamera(camera, params.frameCount, compensation + path.reconnection.time);
+        Ray cameraRay = camera.computeRayThinlensSubPixelRandom(params.frameDim, float2(pixel) + path.reconnection.subPixel, path.reconnection.lensSample);
+
+        path.origin = cameraRay.origin;
+        path.dir = cameraRay.dir;
+
+        float3 lensLocal = camera.data.apertureRadius * (path.reconnection.lensSample.x * normalize(camera.data.cameraU) +
+                                                         path.reconnection.lensSample.y * normalize(camera.data.cameraV));
+        path.prevHitPos = camera.data.posW + lensLocal;
+
+        uint rngConsumed = path.sg.getCount() - init_sample_count;
+        consumedSample(path.sg, kSamplesPerHit - rngConsumed);
+    }
+
     /** Generate the path state for a primary hit in screen space.
         This is treated equivalent to subsequent path vertices to reduce code divergence.
         \param[out] path Path state before the primary hit.
@@ -202,8 +254,10 @@ struct PathTracer
         const uint2 pixel = path.getPixel();
         path.sg = SampleGenerator(pixel, seed);
 
+        uint init_sample_count = path.sg.getCount();
         // Randomize the camera parameters.
         Camera camera = gScene.camera;
+        path.reconnection.seed = uint3(pixel, seed);
         path.reconnection.time = sampleNext1D(path.sg) * camera.data.shutterSpeed;
         path.reconnection.subPixel = sampleNext2D(path.sg);
         path.reconnection.lensSample = (camera.data.apertureRadius > 0.0f) ? sample_disk(sampleNext2D(path.sg)) : float2(0.0f, 0.0f);
@@ -218,6 +272,8 @@ struct PathTracer
         float3 lensLocal = camera.data.apertureRadius * (path.reconnection.lensSample.x * normalize(camera.data.cameraU) +
                                                          path.reconnection.lensSample.y * normalize(camera.data.cameraV));
         path.prevHitPos = camera.data.posW + lensLocal;
+        uint rngConsumed = path.sg.getCount() - init_sample_count;
+        consumedSample(path.sg, kSamplesPerHit - rngConsumed);
     }
 
     /** Generate the path state for a primary hit in screen space.
@@ -256,26 +312,27 @@ struct PathTracer
 
     struct ClosestHitQuery
     {
-        HitInfo traceRay(inout PathState path, const Ray ray, out float hitT)
+        HitInfo traceRay(inout PathState path, const Ray ray, out float hitT, bool isPrevFrame = false)
         {
             SceneRayQuery<kUseAlphaTest> sceneRayQuery;
-            return sceneRayQuery.traceRay(ray, hitT);
+            return sceneRayQuery.traceRay(ray, hitT, RAY_FLAG_NONE, 0xff, isPrevFrame);
         }
     };
 
-    struct VisibilityQuery 
+    struct VisibilityQuery
     {
-        bool traceVisibilityRay(const Ray ray)
+        bool traceVisibilityRay(const Ray ray, bool isPrevFrame = false)
         {
             SceneRayQuery<kUseAlphaTest> sceneRayQuery;
-            return sceneRayQuery.traceVisibilityRay(ray);
+            return sceneRayQuery.traceVisibilityRay(ray, RAY_FLAG_NONE, 0xff, isPrevFrame);
         }
-    };    
+    };
     /** Trace a ray to find the next hit.
         This replaces `PathTracer::nextHit` but without support for volume sampling.
         \param[in,out] path Path state.
+        \param[in] isPrevFrame If true, trace against the previous frame's BVH.
     */
-    void nextHit(inout PathState path)
+    void nextHit(inout PathState path, bool isPrevFrame = false)
     {
         // Advance to next path vertex.
         path.incrementVertexIndex();
@@ -284,9 +341,9 @@ struct PathTracer
         logTraceRay(PixelStatsRayType::ClosestHit);
         const Ray ray = path.getScatterRay();
 
-        ClosestHitQuery chq;        
+        ClosestHitQuery chq;
         float hitT;
-        HitInfo hit = chq.traceRay(path, ray, hitT);
+        HitInfo hit = chq.traceRay(path, ray, hitT, isPrevFrame);
 
         if (hit.isValid())
         {
@@ -316,7 +373,7 @@ struct PathTracer
     bool generateGuideRay(const ShadingData sd, const IMaterialInstance mi, inout PathState path)
     {
         BSDFSample result;
-        bool valid = mi.sample(sd, path.sg, result, kUseBSDFSampling);
+        bool valid = mi.sample(sd, path.sg, result, true);
         if (valid) valid = generateScatterRay(result, sd, mi, path);
 
         return valid;
@@ -334,7 +391,7 @@ struct PathTracer
 
         // Set the lobe mask to a non-zero value, so that the PDF is only of the sampled lobe.
         sd.mtl.setLobeMask(1);
-        bool valid = mi.sample(sd, path.sg, result, kUseBSDFSampling);
+        bool valid = mi.sample(sd, path.sg, result, true);
         path.pdf = result.pdf; // Lobe-specific PDF.
 
         uint componentType = 0;
@@ -356,7 +413,7 @@ struct PathTracer
 
         // If we're at the first or second vertex, we care about which lobe was sampled.
         if (path.getVertexIndex() == 1)
-        {   
+        {
             path.reconnection.firstBSDFComponentType = componentType;
         }
         else if (path.getVertexIndex() == 2)
@@ -367,7 +424,7 @@ struct PathTracer
 
         // Set the lobe mask back to 0 to get the total PDF.
         sd.mtl.setLobeMask(0xF);
-        path.totalPdf = mi.evalPdf(sd, result.wo, kUseBSDFSampling);
+        path.totalPdf = mi.evalPdf(sd, result.wo, true);
 
         if (valid) generateScatterRay({result.wo, result.pdf, result.weight, result.lobeType}, sd, mi, path);
 
@@ -799,6 +856,22 @@ struct PathTracer
         // Load shading data. This is a long latency operation.
         ShadingData sd = loadShadingData(path.hit, path.origin, path.dir);
 
+        // SceneUVRayQuery uvQuery;
+        // Ray uvRay = Ray(float3(gScene.instanceIDToLoDIndex[path.hit.getInstanceID().index] * kUVCompressRatio - kUVRayEpsilon, sd.uv),
+        //                        float3(1.0, 0.0f, 0.0f), 0.0f, kUVRayTMax);
+        // UVHitInfo uvHitInfo = uvQuery.traceRay(uvRay, path.hit.getInstanceID().index);
+        // ShadingData sd1 = loadShadingData(uvHitInfo.hits[0], path.origin, path.dir);
+
+        // TriangleHit hit0 = path.hit.getTriangleHit();
+        // TriangleHit hit1 = uvHitInfo.hits[0].getTriangleHit();
+        // print("hit0 barycentrics:", hit0.barycentrics);
+        // print("hit0 primitiveID:", hit0.primitiveIndex);
+        // print("hit0 instanceID:", path.hit.getInstanceID().index);
+        // print("hit1 barycentrics:", hit1.barycentrics);
+        // print("hit1 primitiveID:", hit1.primitiveIndex);
+        // print("hit1 instanceID:", uvHitInfo.hits[0].getInstanceID().index);
+        // print("UV hit number:", uvHitInfo.count);
+
         float distanceToPrevVertex = length(sd.posW - path.prevHitPos);
         float geometryFactor = abs(dot(sd.faceN, sd.V)) / (distanceToPrevVertex * distanceToPrevVertex);
         float prevScatterPdf = path.pdf;
@@ -814,7 +887,7 @@ struct PathTracer
             Camera camera = gScene.camera;
             gCameraManager.orientCamera(camera, params.frameCount, path.time);
 
-            float3 lensLocal = camera.data.apertureRadius * (path.reconnection.lensSample.x * normalize(camera.data.cameraU) + 
+            float3 lensLocal = camera.data.apertureRadius * (path.reconnection.lensSample.x * normalize(camera.data.cameraU) +
                                                              path.reconnection.lensSample.y * normalize(camera.data.cameraV));
             float3 x0 = camera.data.posW + lensLocal;
 
@@ -833,11 +906,23 @@ struct PathTracer
             float d1 = dist - d0;
 
             path.reconnection.lensVertexJacobian = (d0 * d0) / (d1 * d1) * (abs(dot(-path.dir, sd.faceN))) / (abs(dot(-path.dir, camDir)));
+
+            // compute the jacobian for the primary hit
+            uint lodIndex = gScene.instanceIDToLoDIndex[path.hit.getInstanceID().index];
+            if (gScene.loDLevels[lodIndex] >= 0)
+            {
+                float objectSpaceArea  = gScene.getTriangleArea(path.hit.getTriangleHit());
+                float textureSpaceArea = gScene.getUVTriangleArea(path.hit.getTriangleHit());
+                path.reconnection.firstTextureUV = sd.uv;
+                path.reconnection.firstHitJacobian = textureSpaceArea > 0.0f ? (objectSpaceArea / textureSpaceArea) : 0.0f;
+            }
         }
         else if (path.getVertexIndex() == 2)
         {
             path.reconnection.secondHit = path.hit;
             path.reconnection.secondaryPathJacobian = prevScatterPdf * geometryFactor;
+
+            path.reconnection.secondTextureUV = sd.uv;
 
             // print("Second Hit Normal", sd.faceN);
             // print("Second Hit Incoming Dir", sd.V);
@@ -895,14 +980,14 @@ struct PathTracer
 
         // Add emitted radiance.
         // The primary hit is always included, secondary hits only if emissive lights are enabled and the full light contribution hasn't been sampled elsewhere.
-        bool computeEmissive = isPrimaryHit || kUseEmissiveLights && (!kUseNEE || kUseMIS || !path.isLightSampled() || !isLightSamplable);
+        bool computeEmissive = isPrimaryHit || kUseEmissiveLights && (!path.isLightSampled() || !isLightSamplable);
 
         float3 attenuatedEmission = 0.f;
         if (computeEmissive && any(bsdfProperties.emission > 0.f))
         {
             float misWeight = 1.f;
             float lightPdf = 0.0f;
-            if (kUseEmissiveLights && kUseNEE && kUseMIS && isTriangleHit && !isPrimaryHit && path.isLightSampled() && isLightSamplable)
+            if (kUseEmissiveLights && isTriangleHit && !isPrimaryHit && path.isLightSampled() && isLightSamplable)
             {
                 // If NEE and MIS are enabled, and we've already sampled emissive lights,
                 // then we need to evaluate the MIS weight here to account for the remaining contribution.
@@ -931,6 +1016,8 @@ struct PathTracer
             bool selected = path.reservoir.addVertex(path.sg, 1, path.reconnection.earlyThroughput * path.thp * bsdfProperties.emission * misWeight);
             if (selected)
             {
+                print("path.length", path.getVertexIndex());
+                print("radiance:", path.reconnection.earlyThroughput * path.thp * bsdfProperties.emission * misWeight);
                 // Copy over any relevant accumulated data (e.g. the Jacobian).
                 path.reservoir.selectedReconnection = path.reconnection;
 
@@ -993,10 +1080,11 @@ struct PathTracer
         const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
 
         // Check if we should apply NEE.
-        const bool applyNEE = kUseNEE && hasNonDeltaLobes;
+        const bool applyNEE = hasNonDeltaLobes;
 
         // TODO: Support multiple shadow rays.
         path.setLightSampled(false, false);
+        uint initRngCountNEE = path.sg.getCount();
         if (applyNEE)
         {
             LightSample ls = {};
@@ -1024,9 +1112,9 @@ struct PathTracer
                 // Apply MIS weight.
                 float misWeight = 1.0f;
                 float scatterPdf = 0.0f;
-                if (kUseMIS && ls.lightType != (uint)LightType::Analytic)
+                if (ls.lightType != (uint)LightType::Analytic)
                 {
-                    scatterPdf = mi.evalPdf(sd, ls.dir, kUseBSDFSampling);
+                    scatterPdf = mi.evalPdf(sd, ls.dir, true);
                     misWeight = evalMIS(1, ls.pdf, 1, scatterPdf);
                 }
 
@@ -1140,6 +1228,8 @@ struct PathTracer
                 }
             }
         }
+        uint sampleConsumedNEE = path.sg.getCount() - initRngCountNEE;
+        consumedSample(path.sg, kSamplesPerHit - sampleConsumedNEE);
 
         // Russian roulette to terminate paths early.
         if (kUseRussianRoulette)
@@ -1148,20 +1238,445 @@ struct PathTracer
         }
 
         // Generate the next path segment or terminate.
-        bool valid = generateScatterRay(sd, mi, path);
+        {
+            uint initRngCount = path.sg.getCount();
+            bool valid = generateScatterRay(sd, mi, path);
 
-        // Check if this is the last path vertex.
-        const bool isLastVertex = hasFinishedSurfaceBounces(path);
+            // Check if this is the last path vertex.
+            const bool isLastVertex = hasFinishedSurfaceBounces(path);
 
-        // Terminate if this is the last path vertex and light sampling already completely sampled incident radiance.
-        if (kUseNEE && !kUseMIS && isLastVertex && path.isLightSamplable()) valid = false;
+            // Terminate if this is the last path vertex and light sampling already completely sampled incident radiance.
+            if (isLastVertex && path.isLightSamplable()) valid = false;
 
-        // Terminate caustics paths.
-        if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && path.isSpecular()) valid = false;
+            // Terminate caustics paths.
+            if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && path.isSpecular()) valid = false;
 
-        if (!valid)
+            if (!valid)
+            {
+                path.terminate();
+            }
+            uint sampleConsumed = path.sg.getCount() - initRngCount;
+            consumedSample(path.sg, kSamplesPerHit - sampleConsumed);
+        }
+
+        return sd.posW;
+    }
+
+    /** Handle the case when a scatter ray hits a surface for the random replay.
+        After handling the hit, a new scatter ray is generated or the path is terminated.
+        \param[in,out] path The path state.
+        \return The true position of the hit.
+    */
+    float3 handleHitForRandomReplay(inout PathState path,
+                                    const ReconnectionData reconnectionData)
+    {
+        // Upon hit:
+        // - Load vertex/material data
+        // - Compute MIS weight if path.getVertexIndex() > 1 and emissive hit
+        // - Add emitted radiance
+        // - Sample light(s) using shadow rays
+        // - Sample scatter ray or terminate
+
+        setupPathLogging(path);
+
+        print("reconnectionData.pathLength", reconnectionData.pathLength);
+
+        const bool isPrimaryHit = path.getVertexIndex() == 1;
+        const HitType hitType = path.hit.getType();
+        const bool isTriangleHit = hitType == HitType::Triangle;
+        const bool isCurveHit = kUseCurves && (hitType == HitType::Curve);
+
+        // Load shading data. This is a long latency operation.
+        ShadingData sd = loadShadingData(path.hit, path.origin, path.dir);
+
+        // SceneUVRayQuery uvQuery;
+        // Ray uvRay = Ray(float3(gScene.instanceIDToLoDIndex[path.hit.getInstanceID().index] * kUVCompressRatio - kUVRayEpsilon, sd.uv),
+        //                        float3(1.0, 0.0f, 0.0f), 0.0f, kUVRayTMax);
+        // UVHitInfo uvHitInfo = uvQuery.traceRay(uvRay, path.hit.getInstanceID().index);
+        // sd = loadShadingData(uvHitInfo.hits[0], path.origin, path.dir);
+
+        float distanceToPrevVertex = length(sd.posW - path.prevHitPos);
+        float geometryFactor = abs(dot(sd.faceN, sd.V)) / (distanceToPrevVertex * distanceToPrevVertex);
+        float prevScatterPdf = path.pdf;
+        path.prevHitPos = sd.posW;
+
+        // We can update common reconnection data at certain points.
+        if (path.getVertexIndex() == 1)
+        {
+            // print("First Hit", sd.posW);
+            path.reconnection.firstHit = path.hit;
+            path.reconnection.firstWi = -path.dir;
+
+            Camera camera = gScene.camera;
+            gCameraManager.orientCamera(camera, params.frameCount, path.time);
+
+            float3 lensLocal = camera.data.apertureRadius * (path.reconnection.lensSample.x * normalize(camera.data.cameraU) +
+                                                             path.reconnection.lensSample.y * normalize(camera.data.cameraV));
+            float3 x0 = camera.data.posW + lensLocal;
+
+            float dist = length(sd.posW - x0);
+            float distSquared = dist * dist;
+            float cosNormal = dot(-path.dir, sd.faceN);
+            float cosSensor = dot(normalize(camera.data.cameraW), path.dir);
+
+            path.reconnection.subPixelJacobian = abs(cosNormal / distSquared) / abs(pow(cosSensor, 3));
+
+            // Also hold onto the lens vertex Jacobian
+            float3 camDir = normalize(camera.data.cameraW);
+            float camZ = dot(sd.posW - camera.data.posW, camDir);
+
+            float d0 = (length(camera.data.cameraW) / abs(camZ) * dist);
+            float d1 = dist - d0;
+
+            path.reconnection.lensVertexJacobian = (d0 * d0) / (d1 * d1) * (abs(dot(-path.dir, sd.faceN))) / (abs(dot(-path.dir, camDir)));
+        }
+        else if (path.getVertexIndex() == 2)
+        {
+            path.reconnection.secondHit = path.hit;
+            path.reconnection.secondaryPathJacobian = prevScatterPdf * geometryFactor;
+
+            // print("Second Hit Normal", sd.faceN);
+            // print("Second Hit Incoming Dir", sd.V);
+            // print("Second Hit Position", sd.posW);
+            // print("Distance", distanceToPrevVertex);
+            // print("Cos Theta", abs(dot(sd.faceN, sd.V)));
+            // print("Geometry Factor", geometryFactor);
+            // print("First Scatter Pdf", prevScatterPdf);
+        }
+        else if (path.getVertexIndex() == 3)
+        {
+            path.reconnection.secondaryPathJacobian *= prevScatterPdf;
+            // print("Second Scatter Pdf", prevScatterPdf);
+        }
+
+        const bool isHairMaterial = kUseHairMaterial && (sd.mtl.getMaterialType() == MaterialType::Hair);
+        // TODO: Decouple geometry from the material.
+        const bool isCurvePolyTubeHit = isTriangleHit && isHairMaterial;
+
+        // Account for volume absorption.
+        if (!path.interiorList.isEmpty())
+        {
+            const uint materialID = path.interiorList.getTopMaterialID();
+            let material = gScene.materials.getMaterial(materialID);
+            let vp = material.getHomogeneousVolumeProperties(gScene.materials, materialID);
+            path.thp *= HomogeneousVolumeSampler::evalTransmittance(vp, length(sd.posW - path.origin));
+        }
+
+        // Reject false hits in nested dielectrics.
+        if (!handleNestedDielectrics(sd, path)) return sd.posW;
+
+        logPathVertex();
+
+        // Create BSDF instance and query its properties.
+        let hints = getMaterialInstanceHints(path.hit, isPrimaryHit);
+        let lod = createTextureSampler(path, isPrimaryHit, isTriangleHit);
+        const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, lod, hints);
+        BSDFProperties bsdfProperties = mi.getProperties(sd);
+
+        // Disable specular lobes if caustics are disabled and path already contains a diffuse vertex.
+        bool isSpecular = bsdfProperties.roughness <= params.specularRoughnessThreshold;
+        if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && isSpecular)
+        {
+            sd.mtl.setActiveLobes((uint)LobeType::Diffuse);
+        }
+
+        // Optionally disable emission inside volumes.
+        if (!kUseLightsInDielectricVolumes && path.isInsideDielectricVolume())
+        {
+            bsdfProperties.emission = float3(0.f);
+        }
+
+        // Check if the scatter event is samplable by the light sampling technique.
+        const bool isLightSamplable = path.isLightSamplable();
+
+        // Add emitted radiance.
+        // The primary hit is always included, secondary hits only if emissive lights are enabled and the full light contribution hasn't been sampled elsewhere.
+        bool computeEmissive = isPrimaryHit || kUseEmissiveLights && (!path.isLightSampled() || !isLightSamplable);
+
+        float3 attenuatedEmission = 0.f;
+        if (computeEmissive && any(bsdfProperties.emission > 0.f))
+        {
+            float misWeight = 1.f;
+            float lightPdf = 0.0f;
+            if (kUseEmissiveLights && isTriangleHit && !isPrimaryHit && path.isLightSampled() && isLightSamplable)
+            {
+                // If NEE and MIS are enabled, and we've already sampled emissive lights,
+                // then we need to evaluate the MIS weight here to account for the remaining contribution.
+                // Note that MIS is only applied for hits on emissive triangles (other emissive geometry is not supported).
+
+                // Prepare hit point struct with data needed for emissive light PDF evaluation.
+                TriangleHit triangleHit = path.hit.getTriangleHit();
+                TriangleLightHit hit;
+                hit.triangleIndex = gScene.lightCollection.getTriangleIndex(triangleHit.instanceID, triangleHit.primitiveIndex);
+                hit.posW = sd.posW;
+                hit.normalW = sd.getOrientedFaceNormal();
+
+                // Evaluate PDF at the hit, had it been generated with light sampling.
+                // Emissive light samplers have an option to exclusively sample the upper hemisphere.
+                bool upperHemisphere = path.isLightSampledUpper() && !path.isLightSampledLower();
+                lightPdf = getEmissiveSelectionProbability() * emissiveSampler.evalPdf(path.origin, path.normal, upperHemisphere, hit);
+
+                // Compute MIS weight by combining this with BSDF sampling.
+                // Note we can assume path.pdf > 0.f since we shouldn't have got here otherwise.
+                misWeight = evalMIS(1, path.totalPdf, 1, lightPdf);
+            }
+
+            // Accumulate emitted radiance weighted by path throughput and MIS weight.
+            attenuatedEmission = path.thp * misWeight * bsdfProperties.emission;
+
+            consumedSample(path.sg, 1); // Consume a sample for the reservoir update.
+            print("path.getVertexIndex()", path.getVertexIndex());
+            print("reconnectionData.pathLength", reconnectionData.pathLength);
+            print("reconnectionData.lightIsNEE", reconnectionData.lightIsNEE);
+            // bool selected = path.reservoir.addVertex(path.sg, 1, path.reconnection.earlyThroughput * path.thp * bsdfProperties.emission * misWeight);
+            if (path.getVertexIndex() == reconnectionData.pathLength && !reconnectionData.lightIsNEE)
+            {
+                print("Selected for reconnection!", 1);
+                // Copy over any relevant accumulated data (e.g. the Jacobian).
+                path.reservoir.selectedReconnection = path.reconnection;
+
+                path.reservoir.selectedReconnection.pathLength = path.getVertexIndex();
+                path.reservoir.selectedReconnection.lightIsNEE = false;
+                path.reservoir.selectedReconnection.lightIsDistant = false;
+                path.reservoir.selectedReconnection.lightPdf = lightPdf;
+
+                path.reservoir.integrand = path.reconnection.earlyThroughput * path.thp * bsdfProperties.emission * misWeight;
+                path.terminate();
+
+                // print("BSDF", path.reservoir.selectedReconnection.pathLength);
+                // print("MIS Weight", misWeight);
+                // print("Early Throughput", path.reconnection.earlyThroughput);
+                // print("Path Throughput", path.thp);
+                // print("Light BSDF Emission", bsdfProperties.emission);
+                // print("Path Contribution", path.reconnection.earlyThroughput * path.thp * bsdfProperties.emission * misWeight);
+
+                if (path.getVertexIndex() == 2)
+                {
+                    // Converts solid angle measure to area measure.
+                    path.reservoir.selectedReconnection.lightPdf *= geometryFactor;
+                }
+
+                // if the path length is the second or third vertex, we need to re-evaluate the MIS weight - otherwise, include it.
+                // Here, path.thp = float3(1) if it's the first or second vertex.
+                if (path.getVertexIndex() == 2 || path.getVertexIndex() == 3)
+                {
+                    path.reservoir.selectedReconnection.irradiance = bsdfProperties.emission;
+                }
+                else
+                {
+                    path.reservoir.selectedReconnection.irradiance = path.thp * bsdfProperties.emission * misWeight;
+                }
+            }
+        }
+
+        // Terminate after scatter ray on last vertex has been processed.
+        if (hasFinishedSurfaceBounces(path))
         {
             path.terminate();
+            return sd.posW;
+        }
+
+        // Compute origin for rays traced from this path vertex.
+        if (isCurveHit)
+        {
+            // For curves, we set the new origin at the sphere center.
+            path.origin = sd.posW - sd.frame.N * sd.curveRadius;
+        }
+        else if (isCurvePolyTubeHit)
+        {
+            // For curves tessellated into poly-tubes, we offset the new origin away from the curve center.
+            path.origin = sd.posW + sd.frame.N * sd.curveRadius * 0.1f;
+        }
+        else
+        {
+            path.origin = sd.computeRayOrigin();
+        }
+
+        // Determine if BSDF has non-delta lobes.
+        const uint lobeTypes = mi.getLobeTypes(sd);
+        const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
+
+        // Check if we should apply NEE.
+        const bool applyNEE = hasNonDeltaLobes;
+
+        // TODO: Support multiple shadow rays.
+        path.setLightSampled(false, false);
+        uint initRngCountNEE = path.sg.getCount();
+        if (applyNEE)
+        {
+            LightSample ls = {};
+            bool validSample = false;
+
+            // Setup path vertex.
+            PathVertex vertex = PathVertex(path.getVertexIndex(), sd.posW, sd.faceN, sd.frontFacing);
+
+            // Determine if upper/lower hemispheres need to be sampled.
+            bool sampleUpperHemisphere = isCurveHit || isCurvePolyTubeHit || ((lobeTypes & (uint)LobeType::NonDeltaReflection) != 0);
+            if (!kUseLightsInDielectricVolumes && path.isInsideDielectricVolume()) sampleUpperHemisphere = false;
+            bool sampleLowerHemisphere = isCurveHit || isCurvePolyTubeHit || ((lobeTypes & (uint)LobeType::NonDeltaTransmission) != 0);
+
+            // Sample a light.
+            validSample = generateLightSample(vertex, sampleUpperHemisphere, sampleLowerHemisphere, path.sg, ls);
+            path.setLightSampled(sampleUpperHemisphere, sampleLowerHemisphere);
+
+            if (validSample)
+            {
+                // bool isPunctualLight = ls.pdf == 0.f;
+                // if (ls.lightType == (uint)LightType::Analytic && ls.pdf == 0.f)
+                //     ls.pdf = getAnalyticSelectionProbability(); // analytic light doesn't have a solid angle PDF.
+                float3 Le = ls.Li * ls.pdf;
+
+                // Apply MIS weight.
+                float misWeight = 1.0f;
+                float scatterPdf = 0.0f;
+                if (ls.lightType != (uint)LightType::Analytic)
+                {
+                    scatterPdf = mi.evalPdf(sd, ls.dir, true);
+                    misWeight = evalMIS(1, ls.pdf, 1, scatterPdf);
+                }
+
+                float3 weight = mi.eval(sd, ls.dir, path.sg);
+                float3 Lr = weight * misWeight * ls.Li;
+                if (any(Lr > 0.f))
+                {
+                    Ray ray = ls.getVisibilityRay();
+                    // print("NEE Ray Origin", ray.origin);
+                    // print("NEE Ray Dir", ray.dir);
+                    // print("NEE Ray Dest", ray.origin + ray.dir * ray.tMax);
+
+                    if (isCurvePolyTubeHit)
+                    {
+                        // For curves tessellated into poly-tubes, we make sure that the origin is on the same side as light
+                        // so there is no self-shadowing (transmission lobe of hair BSDF takes care of that).
+                        if (dot(sd.frame.N, ray.dir) < 0.f)
+                        {
+                            ray.origin = ray.origin - sd.frame.N * sd.curveRadius * 2.1f;
+                        }
+                    }
+
+                    if (traceVisibilityRay(ray))
+                    {
+                        // bool selected = path.reservoir.addVertex(path.sg, 1, path.reconnection.earlyThroughput * path.thp * weight * ls.Li * misWeight);
+                        consumedSample(path.sg, 1); // Consume a sample for the reservoir update.
+                        // The path length from NEE is always greater than 1.
+                        if (path.getVertexIndex() + 1 == reconnectionData.pathLength && reconnectionData.lightIsNEE)
+                        {
+                            // Copy over any relevant reconnection data over.
+                            path.reservoir.selectedReconnection = path.reconnection;
+
+                            path.reservoir.selectedReconnection.pathLength = path.getVertexIndex() + 1;
+                            path.reservoir.selectedReconnection.lightIsNEE = true;
+                            path.reservoir.selectedReconnection.irradiance = Le;
+                            path.reservoir.integrand = path.reconnection.earlyThroughput * path.thp * weight * ls.Li * misWeight;
+                            path.terminate();
+
+                            if (path.getVertexIndex() == 1)
+                                path.reservoir.selectedReconnection.transmissionEvent = dot(sd.faceN, sd.V) * dot(sd.faceN, ls.dir) < 0;
+
+                            path.reservoir.selectedReconnection.lightIsDistant = (ls.lightType == (uint)LightType::EnvMap);
+
+                            // print("NEE", path.reservoir.selectedReconnection.pathLength);
+                            // print("MIS Weight", misWeight);
+                            // print("Early Throughput", path.reconnection.earlyThroughput);
+                            // print("Path Throughput", path.thp);
+                            // print("Light NEE BSDF", weight);
+                            // print("Light NEE PDF", ls.pdf);
+                            // print("Light Emission", Le);
+                            // print("Path Contribution", path.reconnection.earlyThroughput * path.thp * weight * ls.Li * misWeight);
+
+                            if (path.getVertexIndex() == 1) // The selected light sample is the second vertex.
+                            {
+                                // Ignore other light types besides environment maps and emissive triangles for now.
+                                if (ls.lightType == (uint)LightType::EnvMap /*|| (ls.lightType == (uint)LightType::Analytic && ls.distance == kMaxLightDistance)*/)
+                                {
+                                    path.reservoir.selectedReconnection.secondHit.data.x = 0;
+                                    path.reservoir.selectedReconnection.secondHit.data.yzw = asuint(ls.dir);
+                                    path.reservoir.selectedReconnection.secondaryPathJacobian = ls.pdf;
+                                    path.reservoir.selectedReconnection.lightPdf = ls.pdf; // No need to convert to area measure because it's a distant light.
+                                }
+                                // else if (ls.lightType == (uint)LightType::Analytic)
+                                // {
+                                //     path.reconnection.secondLightReconnection = ls.origin + ls.dir * ls.distance;
+                                //     if (isPunctualLight) // point
+                                //     {
+                                //         path.reconnection.irradiance /= ls.geometryTerm; // ls.geometry term is 1/d^2
+                                //         path.reconnection.secondHit.data.x = 1;           // use this as type identifier
+                                //     }
+                                //     else // area, sphere
+                                //     {
+                                //         path.reconnection.secondHit.data.x = 2;
+                                //         path.reconnection.secondHit.data.yzw = asuint(ls.normal);
+                                //         path.reconnection.secondaryPathJacobian *= ls.geometryTerm;
+                                //         path.reconnection.secondLightPdf *= ls.geometryTerm; // stored in area measure
+                                //     }
+                                // }
+                                if (ls.lightType == (uint)LightType::Emissive)
+                                {
+                                    TriangleHit neeTriangleHit;
+                                    uint2 meshPrimID = gScene.lightCollection.getSceneMeshPrimID(ls.triangleId);
+                                    GeometryInstanceID neeGeoInstanceId;
+                                    neeGeoInstanceId.index = meshPrimID.x;
+                                    neeTriangleHit.instanceID = neeGeoInstanceId;
+                                    neeTriangleHit.primitiveIndex = meshPrimID.y;
+                                    neeTriangleHit.barycentrics = ls.barycentrics;
+                                    HitInfo neeHitInfo = HitInfo(neeTriangleHit);
+
+                                    path.reservoir.selectedReconnection.secondHit = neeHitInfo;
+
+                                    path.reservoir.selectedReconnection.secondaryPathJacobian = ls.pdf * ls.geometryTerm;
+                                    path.reservoir.selectedReconnection.lightPdf = ls.pdf * ls.geometryTerm; // Convert to area measure
+                                }
+                            }
+                            else if (path.getVertexIndex() == 2) // The selected light sample is the third vertex.
+                            {
+                                // We are currently at the second vertex, and the selected light sample is the next direction.
+                                path.reservoir.selectedReconnection.secondWo = ls.dir;
+
+                                if (ls.lightType == (uint)LightType::Emissive || ls.lightType == (uint)LightType::EnvMap)
+                                {
+                                    // Keep in solid angle measure - NEE always has same probability of selecting the light at the reconnection vertex (does not depend on w_i),
+                                    // so the Jacobian for p(y_{k + 1}) cancels out with each other.
+                                    path.reservoir.selectedReconnection.lightPdf = ls.pdf;
+                                }
+                            }
+                            else
+                            {
+                                path.reservoir.selectedReconnection.irradiance = path.thp * Lr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        uint sampleConsumedNEE = path.sg.getCount() - initRngCountNEE;
+        consumedSample(path.sg, kSamplesPerHit - sampleConsumedNEE);
+
+        // Russian roulette to terminate paths early.
+        if (kUseRussianRoulette)
+        {
+            if (terminatePathByRussianRoulette(path, sampleNext1D(path.sg))) return sd.posW;
+        }
+
+        // Generate the next path segment or terminate.
+        {
+            uint initRngCount = path.sg.getCount();
+            bool valid = generateScatterRay(sd, mi, path);
+
+            // Check if this is the last path vertex.
+            const bool isLastVertex = hasFinishedSurfaceBounces(path);
+
+            // Terminate if this is the last path vertex and light sampling already completely sampled incident radiance.
+            if (isLastVertex && path.isLightSamplable()) valid = false;
+
+            // Terminate caustics paths.
+            if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && path.isSpecular()) valid = false;
+
+            if (!valid)
+            {
+                path.terminate();
+            }
+            uint sampleConsumed = path.sg.getCount() - initRngCount;
+            consumedSample(path.sg, kSamplesPerHit - sampleConsumed);
         }
 
         return sd.posW;
@@ -1174,7 +1689,9 @@ struct PathTracer
         \param[in] secondHit Second hit, which can either be a direction or a position.
         \return The actual position of the hit.
     */
-    float3 handleReconnectionHit(inout PathState path, const ReconnectionData reconnectionData, out float dstJacobian)
+    float3 handleReconnectionHit(inout PathState path,
+                                 const ReconnectionData reconnectionData,
+                                 out float dstJacobian, bool isPrevFrame = false)
     {
         // Upon hit:
         // - Load vertex/material data
@@ -1302,7 +1819,7 @@ struct PathTracer
 
         sd.mtl.setLobeMask(1 << reconnectionData.firstBSDFComponentType);
         float3 lobeScatterBsdf = mi.eval(sd, nextDir, path.sg);
-        float lobeScatterPdf = mi.evalPdf(sd, nextDir, kUseBSDFSampling);
+        float lobeScatterPdf = mi.evalPdf(sd, nextDir, true);
         // print("Lobe Scatter BSDF", lobeScatterBsdf);
         // print("Lobe Scatter PDF", lobeScatterPdf);
 
@@ -1310,7 +1827,7 @@ struct PathTracer
         // Here we use the total PDF when computing the MIS weights.
         sd.mtl.setLobeMask(0);
         float3 totalScatterBsdf = mi.eval(sd, nextDir, path.sg);
-        float totalScatterPdf = mi.evalPdf(sd, nextDir, kUseBSDFSampling);
+        float totalScatterPdf = mi.evalPdf(sd, nextDir, true);
         // print("Total Scatter BSDF", totalScatterBsdf);
         // print("Total Scatter PDF", totalScatterPdf);
 
@@ -1387,7 +1904,7 @@ struct PathTracer
             Ray reconnectionRay = Ray(path.origin, path.dir, 0, rayLength);
 
             // If the visibility ray fails... the shift fails.
-            if (!traceVisibilityRay(reconnectionRay))
+            if (!traceVisibilityRay(reconnectionRay, isPrevFrame))
             {
                 path.terminate();
             }
@@ -1419,12 +1936,12 @@ struct PathTracer
         \param[in] ray The visibility ray parameters
         \return If the ray is visible or not.
     */
-    bool traceVisibilityRay(const Ray ray)
+    bool traceVisibilityRay(const Ray ray, bool isPrevFrame = false)
     {
         logTraceRay(PixelStatsRayType::Visibility);
 
         VisibilityQuery vq;
-        return vq.traceVisibilityRay(ray);
+        return vq.traceVisibilityRay(ray, isPrevFrame);
     }
 
     /** Handle the case when a scatter ray misses the scene.
@@ -1457,7 +1974,7 @@ struct PathTracer
         const bool isLightSamplable = path.isLightSamplable();
 
         // Add env radiance.
-        bool computeEnv = kUseEnvLight && (!kUseNEE || kUseMIS || !path.isLightSampled() || !isLightSamplable);
+        bool computeEnv = kUseEnvLight && (!path.isLightSampled() || !isLightSamplable);
 
         float3 emitterRadiance = 0.f;
         if (computeEnv)
@@ -1466,7 +1983,7 @@ struct PathTracer
 
             float misWeight = 1.f;
             float lightPdf = 0.0f;
-            if (kUseNEE && kUseMIS && path.isLightSampled() && isLightSamplable)
+            if (path.isLightSampled() && isLightSamplable)
             {
                 // If NEE and MIS are enabled, and we've already sampled the env map,
                 // then we need to evaluate the MIS weight here to account for the remaining contribution.
@@ -1556,7 +2073,7 @@ struct PathTracer
                 path.reservoir.selectedReconnection.subPixelJacobian = 1.0f / abs(pow(cosSensor, 3));
 
                 float focalPlaneZ = length(camera.data.cameraW);
-                float d0 = focalPlaneZ / dot(camDir, path.dir); 
+                float d0 = focalPlaneZ / dot(camDir, path.dir);
                 path.reservoir.selectedReconnection.lensVertexJacobian = (d0 * d0) / abs(cosSensor);
 
                 path.reservoir.selectedReconnection.firstWi = -path.dir;
@@ -1566,5 +2083,289 @@ struct PathTracer
         }
 
         path.terminate();
+    }
+
+    // Compute UV -> world Jacobian for a single triangle
+    // p0, p1, p2 : world-space positions of the triangle
+    // uv0, uv1, uv2 : texture coordinates of the triangle
+    float computeJacobianUVToWorld(
+        float3 p0, float3 p1, float3 p2,
+        float2 uv0, float2 uv1, float2 uv2)
+    {
+        float J;
+
+        float3 e1 = p1 - p0;
+        float3 e2 = p2 - p0;
+
+        float2 duv1 = uv1 - uv0;
+        float2 duv2 = uv2 - uv0;
+
+        float du1 = duv1.x;
+        float dv1 = duv1.y;
+        float du2 = duv2.x;
+        float dv2 = duv2.y;
+
+        // Determinant of the 2x2 UV matrix
+        float D = du1 * dv2 - du2 * dv1;
+
+        // Guard against degenerate UVs
+        if (abs(D) < 1e-8f)
+        {
+            // Fallback: just use geometric tangents (not strictly UV-based)
+            // This at least gives you a basis on the surface.
+            float3 n   = normalize(cross(e1, e2));
+            float3 t   = normalize(e1);
+            float3 b   = normalize(cross(n, t));
+
+            float3 dPdu    = t;
+            float3 dPdv    = b;
+            J = length(cross(dPdu, dPdv));
+            return J;
+        }
+
+        float invD = 1.0f / D;
+
+        // From the derivation:
+        // dP/du = ( dv2 * e1 - dv1 * e2 ) / D
+        // dP/dv = (-du2 * e1 + du1 * e2 ) / D
+        float3 dPdu = ( dv2 * e1 - dv1 * e2) * invD;
+        float3 dPdv = (-du2 * e1 + du1 * e2) * invD;
+
+        J = length(cross(dPdu, dPdv));
+
+        return J;
+    }
+
+    /** Handle the case when a scatter ray hits a surface, but don't try any NEE.
+        After handling the hit, try.
+        \param[in,out] path The path state.
+        \param[in] isDirection If the provided second hit is a direction or a position.
+        \param[in] secondHit Second hit, which can either be a direction or a position.
+        \return The actual position of the hit.
+    */
+    float3 handleReconnectionHitForScattering(inout PathState path,
+                                              const ReconnectionData reconnectionData,
+                                              const HitInfo secondHit,
+                                              out float dstJacobian, bool isPrevFrame = false,
+                                              bool usePrevTransforms = false)
+    {
+        // Upon hit:
+        // - Load vertex/material data
+        // - Compute MIS weight if path.getVertexIndex() > 1 and emissive hit
+        // - Add emitted radiance
+        // - Generate next scatter ray based on second hit
+
+        const bool isPrimaryHit = path.getVertexIndex() == 1;
+        const HitType hitType = path.hit.getType();
+        const bool isTriangleHit = hitType == HitType::Triangle;
+        const bool isCurveHit = kUseCurves && (hitType == HitType::Curve);
+
+        // Load shading data using prev frame transform if geometry moved.
+        ShadingData sd = loadShadingData(path.hit, path.origin, path.dir, usePrevTransforms);
+
+        const bool isHairMaterial = kUseHairMaterial && (sd.mtl.getMaterialType() == MaterialType::Hair);
+        // TODO: Decouple geometry from the material.
+        const bool isCurvePolyTubeHit = isTriangleHit && isHairMaterial;
+
+        // Account for volume absorption.
+        if (!path.interiorList.isEmpty())
+        {
+            const uint materialID = path.interiorList.getTopMaterialID();
+            let material = gScene.materials.getMaterial(materialID);
+            let vp = material.getHomogeneousVolumeProperties(gScene.materials, materialID);
+            path.thp *= HomogeneousVolumeSampler::evalTransmittance(vp, length(sd.posW - path.origin));
+        }
+
+        // Reject false hits in nested dielectrics.
+        if (!handleNestedDielectrics(sd, path)) return sd.posW;
+
+        // Create BSDF instance and query its properties.
+        let hints = getMaterialInstanceHints(path.hit, isPrimaryHit);
+        let lod = createTextureSampler(path, isPrimaryHit, isTriangleHit);
+        const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, lod, hints);
+        BSDFProperties bsdfProperties = mi.getProperties(sd);
+
+        // Disable specular lobes if caustics are disabled and path already contains a diffuse vertex.
+        bool isSpecular = bsdfProperties.roughness <= params.specularRoughnessThreshold;
+        if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && isSpecular)
+        {
+            sd.mtl.setActiveLobes((uint)LobeType::Diffuse);
+        }
+
+        // Compute origin for rays traced from this path vertex.
+        if (isCurveHit)
+        {
+            // For curves, we set the new origin at the sphere center.
+            path.origin = sd.posW - sd.frame.N * sd.curveRadius;
+        }
+        else if (isCurvePolyTubeHit)
+        {
+            // For curves tessellated into poly-tubes, we offset the new origin away from the curve center.
+            path.origin = sd.posW + sd.frame.N * sd.curveRadius * 0.1f;
+        }
+        else
+        {
+            path.origin = sd.computeRayOrigin();
+        }
+
+        if (reconnectionData.transmissionEvent)
+        {
+            if (isCurveHit)
+            {
+                // No need to offset the origin in this case.
+            }
+            else if (isCurvePolyTubeHit)
+            {
+                // For curves tessellated into poly-tubes, we make sure that the origin is on the same side as a scatter ray direction
+                // so there is no self-intersection.
+                path.origin = sd.posW - sd.frame.N * sd.curveRadius * 2.1f;
+            }
+            else
+            {
+                // Compute ray origin for next ray segment.
+                path.origin = sd.computeRayOrigin(false);
+
+                // Update interior list and inside volume flag.
+                if (!sd.mtl.isThinSurface())
+                {
+                    uint nestedPriority = sd.mtl.getNestedPriority();
+                    path.interiorList.handleIntersection(sd.materialID, nestedPriority, sd.frontFacing);
+                    path.setInsideDielectricVolume(!path.interiorList.isEmpty());
+                }
+            }
+        }
+
+        bool secondHitIsDistant = (reconnectionData.pathLength == 2) && reconnectionData.lightIsDistant;
+
+        dstJacobian = 1.0f;
+        float3 nextDir = float3(0.0f, 0.0f, 0.0f);
+        ShadingData secondSd = {};
+        float rayLength = kRayTMax;
+
+        if (!secondHitIsDistant)
+        {
+            secondSd = loadShadingData(secondHit, path.origin, float3(0.0f, 0.0f, 0.0f), usePrevTransforms);
+
+            // Generate the next path segment to reconnect with the second hit.
+            float3 shiftedOffset = secondSd.posW - sd.posW;
+            float shiftedDist2 = dot(shiftedOffset, shiftedOffset);
+
+            float shiftedCosine = abs(dot(secondSd.faceN, -normalize(shiftedOffset)));
+            dstJacobian = shiftedCosine / shiftedDist2;
+
+            // The ray is actually being shot from the path origin though,
+            // so we should account for that.
+            float3 adjustedOffset = secondSd.posW - path.origin;
+            nextDir = normalize(adjustedOffset);
+            rayLength = length(adjustedOffset) * 0.999f;
+
+            // print("Second Hit Normal", secondSd.faceN);
+            // print("Second Hit Position", secondSd.posW);
+            // print("Second Hit Incoming Dir", -nextDir);
+            // print("Shifted Cosine", shiftedCosine);
+            // print("Shifted Distance", length(shiftedOffset));
+            // print("Geometry Factor", dstJacobian);
+        }
+        else
+        {
+            nextDir = asfloat(reconnectionData.secondHit.data.yzw);
+        }
+
+        // print("Reconnection Hit", sd.posW);
+
+        sd.mtl.setLobeMask(1 << reconnectionData.firstBSDFComponentType);
+        float3 lobeScatterBsdf = mi.eval(sd, nextDir, path.sg);
+        float lobeScatterPdf = mi.evalPdf(sd, nextDir, true);
+        // print("Lobe Scatter BSDF", lobeScatterBsdf);
+        // print("Lobe Scatter PDF", lobeScatterPdf);
+
+        // We also need to adjust the Jacobian by the probability of sampling a given direction.
+        // Here we use the total PDF when computing the MIS weights.
+        sd.mtl.setLobeMask(0);
+        float3 totalScatterBsdf = mi.eval(sd, nextDir, path.sg);
+        float totalScatterPdf = mi.evalPdf(sd, nextDir, true);
+        // print("Total Scatter BSDF", totalScatterBsdf);
+        // print("Total Scatter PDF", totalScatterPdf);
+
+        path.dir = nextDir;
+        path.pdf = lobeScatterPdf;
+
+        // TODO: this could probably be cleaned up quite a bit... conditionals are just being used right now for clarity.
+        if (reconnectionData.pathLength == 2)
+        {
+            // Convert the light PDF back to the relevant solid angle measure.
+            // print("Area Measure Light PDF", reconnectionData.lightPdf);
+            float lightPdf = reconnectionData.lightPdf / dstJacobian;
+            // print("Solid Angle Measure Light PDF", lightPdf);
+            float misWeight = 1.0f;
+            if (reconnectionData.lightIsNEE)
+            {
+                if (!any(totalScatterBsdf > 0.0f) || totalScatterPdf == 0.0f)
+                {
+                    path.terminate();
+                    return sd.posW;
+                }
+
+                dstJacobian *= lightPdf;
+                misWeight = evalMIS(1, lightPdf, 1, totalScatterPdf);
+                path.thp *= totalScatterBsdf / lightPdf;
+
+                // print("Dst Jacobian", dstJacobian);
+                // print("MIS Weight", misWeight);
+                // print("Light PDF", lightPdf);
+                // print("Scatter BSDF", totalScatterBsdf);
+            }
+            else
+            {
+                if (!any(lobeScatterBsdf > 0.0f) || lobeScatterPdf == 0.0f)
+                {
+                    path.terminate();
+                    return sd.posW;
+                }
+
+                dstJacobian *= lobeScatterPdf;
+                misWeight = evalMIS(1, totalScatterPdf, 1, lightPdf);
+                path.thp *= lobeScatterBsdf / lobeScatterPdf;
+            }
+
+            path.thp *= misWeight;
+        }
+        else
+        {
+            if (!any(lobeScatterBsdf > 0.0f) || lobeScatterPdf == 0.0f)
+            {
+                path.terminate();
+                return sd.posW;
+            }
+
+            // print("Lobe Scatter BSDF", lobeScatterBsdf);
+            // print("Lobe Scatter PDF", lobeScatterPdf);
+
+            dstJacobian *= lobeScatterPdf;
+            path.thp *= lobeScatterBsdf / lobeScatterPdf;
+        }
+
+        bool valid = any(path.thp > 0.f);
+
+        // Terminate caustics paths.
+        if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && path.isSpecular()) valid = false;
+
+        if (!valid)
+        {
+            path.terminate();
+        }
+        else
+        {
+            // If the ray is valid, we shoot a visibility ray to the second vertex (be careful about unintended intersections).
+            Ray reconnectionRay = Ray(path.origin, path.dir, 0, rayLength);
+
+            // If the visibility ray fails... the shift fails.
+            if (!traceVisibilityRay(reconnectionRay, isPrevFrame))
+            {
+                path.terminate();
+            }
+        }
+
+        return sd.posW;
     }
 };

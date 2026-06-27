@@ -59,6 +59,8 @@ struct Scene
 {
     // Raytracing
     [root] RaytracingAccelerationStructure rtAccel;
+    [root] RaytracingAccelerationStructure prevRtAccel;
+    [root] RaytracingAccelerationStructure uvRTAccel;
 
     // Instance transforms
     [root] StructuredBuffer<float4x4> worldMatrices;
@@ -74,6 +76,7 @@ struct Scene
 
     /// Vertex data for this frame.
     SplitVertexBuffer vertices;
+    SplitVertexBuffer uvVertices; // vertices for UV-BVH
 
     StructuredBuffer<PrevVertexData> prevVertices;                  ///< Vertex data for the previous frame, for dynamic meshes only.
 #if SCENE_HAS_INDEXED_VERTICES
@@ -114,6 +117,13 @@ struct Scene
     uint gridVolumeCount;
     StructuredBuffer<GridVolume> gridVolumes;
     Grid grids[ArrayMax<1, SCENE_GRID_COUNT>.value]; // Zero-length arrays are not supported.
+
+    StructuredBuffer<int> instanceIDToLoDIndex;           ///< Mapping from geometry instance ID to LoD index.
+    StructuredBuffer<int> loDLevels;
+    StructuredBuffer<int> prevLoDLevels;
+    int maxLoDLevel;
+    bool isLoDChanged;
+    bool isGeometryMoved;
 
     // Geometry access
 
@@ -340,6 +350,15 @@ struct Scene
         return vertices[index].unpack();
     }
 
+    /** Return UV vertex data for a vertex.
+        \param[in] index Global vertex index.
+        \return UV vertex data.
+    */
+    StaticVertexData getUVVertex(const uint index)
+    {
+        return uvVertices[index].unpack();
+    }
+
     /** Returns a triangle's face normal in object space.
         \param[in] vertices Unpacked fetched vertices which can be used for further computations involving individual vertices.
         \param[in] isFrontFaceCW True if front-facing side has clockwise winding in object space.
@@ -513,6 +532,75 @@ struct Scene
     VertexData getVertexData(const TriangleHit hit)
     {
         return getVertexData(hit.instanceID, hit.primitiveIndex, hit.getBarycentricWeights());
+    }
+
+    /** Returns the surface area of a given hitpoint's triangle.
+        \param[in] hit Triangle hit info.
+        \return Triangle area in world space units.
+    */
+    float getTriangleArea(const TriangleHit hit)
+    {
+        const uint3 vtxIndices = getIndices(hit.instanceID, hit.primitiveIndex);
+        const StaticVertexData vertices[3] = { getVertex(vtxIndices[0]), getVertex(vtxIndices[1]), getVertex(vtxIndices[2]) };
+        const float4x4 worldMat = gScene.getWorldMatrix(hit.instanceID);
+        const float3 AB = mul(worldMat, float4(vertices[1].position, 1.f)).xyz - mul(worldMat, float4(vertices[0].position, 1.f)).xyz;
+        const float3 AC = mul(worldMat, float4(vertices[2].position, 1.f)).xyz - mul(worldMat, float4(vertices[0].position, 1.f)).xyz;
+
+        return 0.5f * length(cross(AB, AC));
+    }
+
+    /** Return the surface area of a given UV hitpoint's triangle.
+        \param[in] hit UV triangle hit info.
+        \return Triangle area in world space units.
+    */
+    float getUVTriangleArea(const TriangleHit hit)
+    {
+        const uint3 vtxIndices = getIndices(hit.instanceID, hit.primitiveIndex);
+        const StaticVertexData vertices[3] = { getUVVertex(vtxIndices[0]), getUVVertex(vtxIndices[1]), getUVVertex(vtxIndices[2]) };
+        const float3 AB = vertices[1].position - vertices[0].position;
+        const float3 AC = vertices[2].position - vertices[0].position;
+
+        return 0.5f * length(cross(AB, AC));
+    }
+
+    void getTriangleVerticesPos(const TriangleHit hit, out float3 pos[3])
+    {
+        const uint3 vtxIndices = getIndices(hit.instanceID, hit.primitiveIndex);
+        const StaticVertexData vertices[3] = { gScene.getVertex(vtxIndices[0]), gScene.getVertex(vtxIndices[1]), gScene.getVertex(vtxIndices[2]) };
+        const float4x4 worldMat = gScene.getWorldMatrix(hit.instanceID);
+
+        [unroll]
+        for (int i = 0; i < 3; i++)
+        {
+            pos[i] = mul(worldMat, float4(vertices[i].position, 1.f)).xyz;
+        }
+    }
+
+    void getTriangleVerticesUVs(const TriangleHit hit, out float2 uvs[3])
+    {
+        const uint3 vtxIndices = getIndices(hit.instanceID, hit.primitiveIndex);
+        const StaticVertexData vertices[3] = { gScene.getVertex(vtxIndices[0]), gScene.getVertex(vtxIndices[1]), gScene.getVertex(vtxIndices[2]) };
+
+        [unroll]
+        for (int i = 0; i < 3; i++)
+        {
+            uvs[i] = vertices[i].texCrd;
+        }
+    }
+
+
+    float3 getTriangleHitPos(const TriangleHit hit)
+    {
+        const uint3 vtxIndices = getIndices(hit.instanceID, hit.primitiveIndex);
+        const StaticVertexData vertices[3] = { gScene.getVertex(vtxIndices[0]), gScene.getVertex(vtxIndices[1]), gScene.getVertex(vtxIndices[2]) };
+        const float3 barycentrics = hit.getBarycentricWeights();
+        const float4x4 worldMat = gScene.getWorldMatrix(hit.instanceID);
+
+        float3 pos = vertices[0].position * barycentrics[0];
+        pos += vertices[1].position * barycentrics[1];
+        pos += vertices[2].position * barycentrics[2];
+        pos = mul(worldMat, float4(pos, 1.f)).xyz;
+        return pos;
     }
 
     /** Returns the interpolated vertex attributes for a given hitpoint.

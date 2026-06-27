@@ -1,4 +1,5 @@
 /***************************************************************************
+ *
  # Copyright (c) 2015-25, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
@@ -38,21 +39,24 @@ namespace
     // Initial Candidate Generation
     const std::string kInitialCandidatesFile = "RenderPasses/ReservoirSplatting/InitialCandidates.cs.slang";
     // Gather Temporal Resampling
-    const std::string kRobustReuseOptimizationFile = "RenderPasses/ReservoirSplatting/RobustReuseOptimization.rt.slang";
+    const std::string kRobustReuseOptimizationFile = "RenderPasses/ReservoirSplatting/RobustReuseOptimization.cs.slang";
     const std::string kCollectTemporalSamplesFile = "RenderPasses/ReservoirSplatting/CollectTemporalSamples.cs.slang";
-    const std::string kGatherTemporalResamplingFile = "RenderPasses/ReservoirSplatting/GatherTemporalResampling.rt.slang";
+    const std::string kGatherTemporalResamplingFile = "RenderPasses/ReservoirSplatting/GatherTemporalResampling.cs.slang";
     // Scatter Temporal Resampling
-    const std::string kReprojectTemporalSamplesFile = "RenderPasses/ReservoirSplatting/ReprojectTemporalSamples.rt.slang";
+    const std::string kReprojectTemporalSamplesFile = "RenderPasses/ReservoirSplatting/ReprojectTemporalSamples.cs.slang";
     const std::string kSortReprojectedReservoirsFile = "RenderPasses/ReservoirSplatting/SortReprojectedReservoirs.cs.slang";
-    const std::string kScatterTemporalResamplingFile = "RenderPasses/ReservoirSplatting/ScatterTemporalResampling.rt.slang";
+    const std::string kScatterTemporalResamplingFile = "RenderPasses/ReservoirSplatting/ScatterTemporalResampling.cs.slang";
     // Scatter + Backup Temporal Resampling
-    const std::string kScatterBackupTemporalResamplingFile = "RenderPasses/ReservoirSplatting/ScatterBackupTemporalResampling.rt.slang";
+    const std::string kScatterBackupTemporalResamplingFile = "RenderPasses/ReservoirSplatting/ScatterBackupTemporalResampling.cs.slang";
     // Multi-Scatter Temporal Resampling
-    const std::string kMultiReprojectTemporalSamplesFile = "RenderPasses/ReservoirSplatting/MultiReprojectTemporalSamples.rt.slang";
+    const std::string kMultiReprojectTemporalSamplesFile = "RenderPasses/ReservoirSplatting/MultiReprojectTemporalSamples.cs.slang";
     const std::string kMultiSortReprojectedReservoirsFile = "RenderPasses/ReservoirSplatting/MultiSortReprojectedReservoirs.cs.slang";
-    const std::string kMultiScatterTemporalResamplingFile = "RenderPasses/ReservoirSplatting/MultiScatterTemporalResampling.rt.slang";
+    const std::string kMultiScatterTemporalResamplingFile = "RenderPasses/ReservoirSplatting/MultiScatterTemporalResampling.cs.slang";
+    // Random-Replay Temporal Resampling
+    const std::string kRandomReplayTemporalSamplesFile = "RenderPasses/ReservoirSplatting/RandomReplayTemporalSamples.cs.slang";
+    const std::string kRandomReplayTemporalResamplingFile = "RenderPasses/ReservoirSplatting/RandomReplayTemporalResampling.cs.slang";
     // Spatial Resampling
-    const std::string kSpatialResamplingFile = "RenderPasses/ReservoirSplatting/SpatialResampling.rt.slang";
+    const std::string kSpatialResamplingFile = "RenderPasses/ReservoirSplatting/SpatialResampling.cs.slang";
     // Resolve ReSTIR
     const std::string kResolveReSTIRFile = "RenderPasses/ReservoirSplatting/ResolveReSTIR.cs.slang";
 
@@ -104,10 +108,7 @@ namespace
 
     const std::string kSampleGenerator = "sampleGenerator";
     const std::string kFixedSeed = "fixedSeed";
-    const std::string kUseBSDFSampling = "useBSDFSampling";
     const std::string kUseRussianRoulette = "useRussianRoulette";
-    const std::string kUseNEE = "useNEE";
-    const std::string kUseMIS = "useMIS";
     const std::string kMISHeuristic = "misHeuristic";
     const std::string kMISPowerExponent = "misPowerExponent";
     const std::string kEmissiveSampler = "emissiveSampler";
@@ -155,6 +156,11 @@ void ReservoirSplatting::registerBindings(pybind11::module& m)
     pass.def_property("fixedSeed",
         [](const ReservoirSplatting* pt) { return pt->mParams.fixedSeed; },
         [](ReservoirSplatting* pt, uint32_t value) { pt->mParams.fixedSeed = value; }
+    );
+
+    pass.def_property("seed",
+        [](const ReservoirSplatting* pt) { return pt->mParams.seed; },
+        [](ReservoirSplatting* pt, uint32_t value) { pt->mParams.seed = value; }
     );
 }
 
@@ -206,10 +212,7 @@ void ReservoirSplatting::parseProperties(const Properties& props)
         // Sampling parameters
         else if (key == kSampleGenerator) mStaticParams.sampleGenerator = value;
         else if (key == kFixedSeed) { mParams.fixedSeed = value; mParams.useFixedSeed = true; }
-        else if (key == kUseBSDFSampling) mStaticParams.useBSDFSampling = value;
         else if (key == kUseRussianRoulette) mStaticParams.useRussianRoulette = value;
-        else if (key == kUseNEE) mStaticParams.useNEE = value;
-        else if (key == kUseMIS) mStaticParams.useMIS = value;
         else if (key == kMISHeuristic) mStaticParams.misHeuristic = value;
         else if (key == kMISPowerExponent) mStaticParams.misPowerExponent = value;
         else if (key == kEmissiveSampler) mStaticParams.emissiveSampler = value;
@@ -325,10 +328,7 @@ Properties ReservoirSplatting::getProperties() const
     // Sampling parameters
     props[kSampleGenerator] = mStaticParams.sampleGenerator;
     if (mParams.useFixedSeed) props[kFixedSeed] = mParams.fixedSeed;
-    props[kUseBSDFSampling] = mStaticParams.useBSDFSampling;
     props[kUseRussianRoulette] = mStaticParams.useRussianRoulette;
-    props[kUseNEE] = mStaticParams.useNEE;
-    props[kUseMIS] = mStaticParams.useMIS;
     props[kMISHeuristic] = mStaticParams.misHeuristic;
     props[kMISPowerExponent] = mStaticParams.misPowerExponent;
     props[kEmissiveSampler] = mStaticParams.emissiveSampler;
@@ -470,6 +470,12 @@ void ReservoirSplatting::execute(RenderContext* pRenderContext, const RenderData
                 multiScatterTemporalResampling(pRenderContext, renderData);
                 break;
             }
+            case TemporalReuse::RandomReplay:
+            {
+                randomReplayTemporalSamples(pRenderContext, renderData);
+                randomReplayTemporalResampling(pRenderContext, renderData);
+                break;
+            }
         }
     }
 
@@ -583,7 +589,7 @@ bool ReservoirSplatting::renderReSTIRUI(Gui::Widgets& widget)
         {
             const bool noMotionBlur = (mpScene == nullptr) || (mpScene->getCamera()->getShutterSpeed() == 0.0);
 
-            // Make sure to delete the multi-splatting option if motion blur is disabled. 
+            // Make sure to delete the multi-splatting option if motion blur is disabled.
             std::function<bool(TemporalReuse)> filter = [noMotionBlur](TemporalReuse reuseOption) {
                 return !(noMotionBlur && reuseOption == TemporalReuse::MultiScatter);
             };
@@ -701,47 +707,45 @@ bool ReservoirSplatting::renderRenderingUI(Gui::Widgets& widget)
         dirty = true;
     }
 
-    dirty |= widget.checkbox("BSDF Importance Sampling", mStaticParams.useBSDFSampling);
-    widget.tooltip("BSDF importance sampling should normally be enabled.\n\n"
-        "If disabled, cosine-weighted hemisphere sampling is used for debugging purposes");
-
     dirty |= widget.checkbox("Russian Roulette", mStaticParams.useRussianRoulette);
     widget.tooltip("Use russian roulette to terminate low throughput paths.");
 
-    dirty |= widget.checkbox("Next-Event Estimation (NEE)", mStaticParams.useNEE);
-    widget.tooltip("Use next-event estimation.\nThis option enables direct illumination sampling at each path vertex.");
+    dirty |= widget.dropdown("MIS Heuristic", mStaticParams.misHeuristic);
 
-    if (mStaticParams.useNEE)
+    if (mStaticParams.misHeuristic == MISHeuristic::PowerExp)
     {
-        dirty |= widget.checkbox("Multiple Importance Sampling (MIS)", mStaticParams.useMIS);
-        widget.tooltip("When enabled, BSDF sampling is combined with light sampling for the environment map and emissive lights.\n"
-            "Note that MIS has currently no effect on analytic lights.");
+        dirty |= widget.var("MIS Power Exponent", mStaticParams.misPowerExponent, 0.01f, 10.f);
+    }
 
-        if (mStaticParams.useMIS)
+    if (mpScene && mpScene->useEmissiveLights())
+    {
+        if (auto group = widget.group("Emissive Sampler"))
         {
-            dirty |= widget.dropdown("MIS Heuristic", mStaticParams.misHeuristic);
+            // LightBVHs cannot be used with ReSTIR.
+            bool enabledReSTIR = mReSTIRParams.enableTemporalResampling || mReSTIRParams.enableSpatialResampling;
+            std::function<bool(EmissiveLightSamplerType)> filter = [enabledReSTIR](EmissiveLightSamplerType lightSampler)
+            { return !(enabledReSTIR && lightSampler == EmissiveLightSamplerType::LightBVH) &&
+                      (lightSampler != EmissiveLightSamplerType::Null); };
 
-            if (mStaticParams.misHeuristic == MISHeuristic::PowerExp)
+            if (widget.dropdown("Emissive Sampler", mStaticParams.emissiveSampler, false, filter))
             {
-                dirty |= widget.var("MIS Power Exponent", mStaticParams.misPowerExponent, 0.01f, 10.f);
+                resetLighting();
+                dirty = true;
             }
-        }
+            widget.tooltip("Selects which light sampler to use for importance sampling of emissive geometry.", true);
 
-        if (mpScene && mpScene->useEmissiveLights())
-        {
-            if (auto group = widget.group("Emissive Sampler"))
+            // There is a case where the LightBVH was selected before ReSTIR was enabled.
+            // In this case, we should default back to the power emissive light sampler.
+            if (enabledReSTIR && mStaticParams.emissiveSampler == EmissiveLightSamplerType::LightBVH)
             {
-                if (widget.dropdown("Emissive Sampler", mStaticParams.emissiveSampler))
-                {
-                    resetLighting();
-                    dirty = true;
-                }
-                widget.tooltip("Selects which light sampler to use for importance sampling of emissive geometry.", true);
+                resetLighting();
+                dirty = true;
+                mStaticParams.emissiveSampler = EmissiveLightSamplerType::Power;
+            }
 
-                if (mpEmissiveSampler)
-                {
-                    if (mpEmissiveSampler->renderUI(group)) mOptionsChanged = true;
-                }
+            if (mpEmissiveSampler)
+            {
+                if (mpEmissiveSampler->renderUI(group)) mOptionsChanged = true;
             }
         }
     }
@@ -934,6 +938,8 @@ void ReservoirSplatting::resetPrograms()
     mpScatterTemporalResamplingPass = nullptr;
     mpScatterBackupTemporalResamplingPass = nullptr;
     mpMultiScatterTemporalResamplingPass = nullptr;
+    mpRandomReplayTemporalSamplesPass = nullptr;
+    mpRandomReplayTemporalResamplingPass = nullptr;
     mpSpatialResamplingPass = nullptr;
 
     mpReflectTypes = nullptr;
@@ -967,8 +973,8 @@ void ReservoirSplatting::updatePrograms()
     // if (!mpInitialCandidatesPass)
     //     mpInitialCandidatesPass = std::make_unique<TracePass>(mpDevice, kInitialCandidatesFile, "initialCandidates", "", mpScene, defines, globalTypeConformances);
     // mpInitialCandidatesPass->prepareProgram(mpDevice, defines);
-    
-    if (!mpInitialCandidatesPass)    
+
+    if (!mpInitialCandidatesPass)
     {
         ProgramDesc desc = baseDesc;
         desc.addShaderLibrary(kInitialCandidatesFile).csEntry("main");
@@ -978,8 +984,13 @@ void ReservoirSplatting::updatePrograms()
     mpInitialCandidatesPass->setVars(nullptr);
 
     if (!mpRobustReuseOptimizationPass)
-        mpRobustReuseOptimizationPass = std::make_unique<TracePass>(mpDevice, kRobustReuseOptimizationFile, "robustReuseOptimization", "", mpScene, defines, globalTypeConformances);
-    mpRobustReuseOptimizationPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kRobustReuseOptimizationFile).csEntry("main");
+        mpRobustReuseOptimizationPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpRobustReuseOptimizationPass->getProgram()->addDefines(defines);
+    mpRobustReuseOptimizationPass->setVars(nullptr);
 
     if (!mpCollectTemporalSamplesPass)
     {
@@ -989,12 +1000,22 @@ void ReservoirSplatting::updatePrograms()
     }
 
     if (!mpReprojectTemporalSamplesPass)
-        mpReprojectTemporalSamplesPass = std::make_unique<TracePass>(mpDevice, kReprojectTemporalSamplesFile, "reprojectTemporalSamples", "", mpScene, defines, globalTypeConformances);
-    mpReprojectTemporalSamplesPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kReprojectTemporalSamplesFile).csEntry("main");
+        mpReprojectTemporalSamplesPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpReprojectTemporalSamplesPass->getProgram()->addDefines(defines);
+    mpReprojectTemporalSamplesPass->setVars(nullptr);
 
     if (!mpMultiReprojectTemporalSamplesPass)
-        mpMultiReprojectTemporalSamplesPass = std::make_unique<TracePass>(mpDevice, kMultiReprojectTemporalSamplesFile, "multiReprojectTemporalSamples", "", mpScene, defines, globalTypeConformances);
-    mpMultiReprojectTemporalSamplesPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kMultiReprojectTemporalSamplesFile).csEntry("main");
+        mpMultiReprojectTemporalSamplesPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpMultiReprojectTemporalSamplesPass->getProgram()->addDefines(defines);
+    mpMultiReprojectTemporalSamplesPass->setVars(nullptr);
 
     if (!mpComputeCellOffsetsPass)
     {
@@ -1032,24 +1053,67 @@ void ReservoirSplatting::updatePrograms()
     }
 
     if (!mpGatherTemporalResamplingPass)
-        mpGatherTemporalResamplingPass = std::make_unique<TracePass>(mpDevice, kGatherTemporalResamplingFile, "gatherTemporalResampling", "", mpScene, defines, globalTypeConformances);
-    mpGatherTemporalResamplingPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kGatherTemporalResamplingFile).csEntry("main");
+        mpGatherTemporalResamplingPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpGatherTemporalResamplingPass->getProgram()->addDefines(defines);
+    mpGatherTemporalResamplingPass->setVars(nullptr);
 
     if (!mpScatterTemporalResamplingPass)
-        mpScatterTemporalResamplingPass = std::make_unique<TracePass>(mpDevice, kScatterTemporalResamplingFile, "scatterTemporalResampling", "", mpScene, defines, globalTypeConformances);
-    mpScatterTemporalResamplingPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kScatterTemporalResamplingFile).csEntry("main");
+        mpScatterTemporalResamplingPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpScatterTemporalResamplingPass->getProgram()->addDefines(defines);
+    mpScatterTemporalResamplingPass->setVars(nullptr);
 
     if (!mpMultiScatterTemporalResamplingPass)
-        mpMultiScatterTemporalResamplingPass = std::make_unique<TracePass>(mpDevice, kMultiScatterTemporalResamplingFile, "multiScatterTemporalResampling", "", mpScene, defines, globalTypeConformances);
-    mpMultiScatterTemporalResamplingPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kMultiScatterTemporalResamplingFile).csEntry("main");
+        mpMultiScatterTemporalResamplingPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpMultiScatterTemporalResamplingPass->getProgram()->addDefines(defines);
+    mpMultiScatterTemporalResamplingPass->setVars(nullptr);
 
     if (!mpScatterBackupTemporalResamplingPass)
-        mpScatterBackupTemporalResamplingPass = std::make_unique<TracePass>(mpDevice, kScatterBackupTemporalResamplingFile, "scatterBackupTemporalResampling", "", mpScene, defines, globalTypeConformances);
-    mpScatterBackupTemporalResamplingPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kScatterBackupTemporalResamplingFile).csEntry("main");
+        mpScatterBackupTemporalResamplingPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpScatterBackupTemporalResamplingPass->getProgram()->addDefines(defines);
+    mpScatterBackupTemporalResamplingPass->setVars(nullptr);
+
+    if (!mpRandomReplayTemporalResamplingPass)
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kRandomReplayTemporalResamplingFile).csEntry("main");
+        mpRandomReplayTemporalResamplingPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpRandomReplayTemporalResamplingPass->getProgram()->addDefines(defines);
+    mpRandomReplayTemporalResamplingPass->setVars(nullptr);
+
+    if (!mpRandomReplayTemporalSamplesPass)
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kRandomReplayTemporalSamplesFile).csEntry("main");
+        mpRandomReplayTemporalSamplesPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpRandomReplayTemporalSamplesPass->getProgram()->addDefines(defines);
+    mpRandomReplayTemporalSamplesPass->setVars(nullptr);
 
     if (!mpSpatialResamplingPass)
-        mpSpatialResamplingPass = std::make_unique<TracePass>(mpDevice, kSpatialResamplingFile, "spatialResampling", "", mpScene, defines, globalTypeConformances);
-    mpSpatialResamplingPass->prepareProgram(mpDevice, defines);
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kSpatialResamplingFile).csEntry("main");
+        mpSpatialResamplingPass = ComputePass::create(mpDevice, desc, defines, false);
+    }
+    mpSpatialResamplingPass->getProgram()->addDefines(defines);
+    mpSpatialResamplingPass->setVars(nullptr);
 
     if (!mpReflectTypes)
     {
@@ -1388,6 +1452,7 @@ void ReservoirSplatting::prepareCameraManager(const RenderData& renderData, bool
         {
             var["cameraPositions"][i] = mpScene->getCamera()->getPosition();
             var["cameraTargets"][i] = mpScene->getCamera()->getTarget();
+            var["cameraFocalDistances"][i] = mpScene->getCamera()->getFocalDistance();
         }
     }
     else
@@ -1395,6 +1460,7 @@ void ReservoirSplatting::prepareCameraManager(const RenderData& renderData, bool
         int currIndex = mParams.frameCount % mCameraParams.currNumKeyframes;
         var["cameraPositions"][currIndex] = mpScene->getCamera()->getPosition();
         var["cameraTargets"][currIndex] = mpScene->getCamera()->getTarget();
+        var["cameraFocalDistances"][currIndex] = mpScene->getCamera()->getFocalDistance();
     }
 }
 
@@ -1698,6 +1764,7 @@ void ReservoirSplatting::tracePass(RenderContext* pRenderContext, const RenderDa
 
     // Bind global resources.
     auto var = tracePass.pVars->getRootVar();
+    mpScene->bindShaderData(var["gScene"]);
     mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"], 2);
 
     if (mVarsChanged) mpSampleGenerator->bindShaderData(var);
@@ -1734,13 +1801,21 @@ void ReservoirSplatting::initialCandidateGeneration(RenderContext* pRenderContex
 
 void ReservoirSplatting::robustReuseOptimization(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto var = mpRobustReuseOptimizationPass->pVars->getRootVar()["CB"]["gRobustReuseOptimization"];
+    auto vars = mpRobustReuseOptimizationPass->getRootVar();
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    vars["gPathTracer"] = mpPathTracerBlock;
+
+    auto var  = vars["CB"]["gRobustReuseOptimization"];
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
     var["params"].setBlob(mParams);
     var["prevReservoirs"] = mpPrevReservoirs;
     var["prevReconnectionData"] = mpPrevReconnectionData;
     var["shiftedPaths"] = mpShiftedPaths;
+    mpPixelStats->prepareProgram(mpRobustReuseOptimizationPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpRobustReuseOptimizationPass->getProgram(), vars);
 
-    tracePass(pRenderContext, renderData, *mpRobustReuseOptimizationPass);
+    mpRobustReuseOptimizationPass->execute(pRenderContext, {mParams.frameDim, 1u});
 }
 
 void ReservoirSplatting::collectTemporalSamples(RenderContext* pRenderContext, const RenderData& renderData)
@@ -1773,7 +1848,13 @@ void ReservoirSplatting::reprojectTemporalSamples(RenderContext* pRenderContext,
     pRenderContext->clearUAV(mpGlobalCounters->getUAV().get(), uint4(0));
     pRenderContext->clearUAV(mpCellCounters->getUAV().get(), uint4(0));
 
-    auto var = mpReprojectTemporalSamplesPass->pVars->getRootVar()["CB"]["gReprojectTemporalSamples"];
+    auto vars = mpReprojectTemporalSamplesPass->getRootVar();
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    vars["gPathTracer"] = mpPathTracerBlock;
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
+
+    auto var =  vars["CB"]["gReprojectTemporalSamples"];
     var["params"].setBlob(mParams);
     var["globalCounters"] = mpGlobalCounters;
     var["cellCounters"] = mpCellCounters;
@@ -1781,13 +1862,21 @@ void ReservoirSplatting::reprojectTemporalSamples(RenderContext* pRenderContext,
     var["scatteredReservoirs"] = mpScatteredReservoirs;
     var["prevReservoirs"] = mpPrevReservoirs;
     var["prevReconnectionData"] = mpPrevReconnectionData;
+    mpPixelStats->prepareProgram(mpReprojectTemporalSamplesPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpReprojectTemporalSamplesPass->getProgram(), vars);
 
-    tracePass(pRenderContext, renderData, *mpReprojectTemporalSamplesPass);
+    mpReprojectTemporalSamplesPass->execute(pRenderContext, {mParams.frameDim, 1u});
 }
 
 void ReservoirSplatting::multiReprojectTemporalSamples(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto var = mpMultiReprojectTemporalSamplesPass->pVars->getRootVar()["CB"]["gMultiReprojectTemporalSamples"];
+    auto vars = mpMultiReprojectTemporalSamplesPass->getRootVar();
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    vars["gPathTracer"] = mpPathTracerBlock;
+
+    auto var = vars["CB"]["gMultiReprojectTemporalSamples"];
     var["params"].setBlob(mParams);
 
     for (uint32_t i = 0; i < mReSTIRParams.numTimePartitions; i++)
@@ -1803,8 +1892,10 @@ void ReservoirSplatting::multiReprojectTemporalSamples(RenderContext* pRenderCon
 
     var["prevReservoirs"] = mpPrevReservoirs;
     var["prevReconnectionData"] = mpPrevReconnectionData;
+    mpPixelStats->prepareProgram(mpMultiReprojectTemporalSamplesPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpMultiReprojectTemporalSamplesPass->getProgram(), vars);
 
-    tracePass(pRenderContext, renderData, *mpMultiReprojectTemporalSamplesPass);
+    mpMultiReprojectTemporalSamplesPass->execute(pRenderContext, {mParams.frameDim, 1u});
 }
 
 void ReservoirSplatting::sortReprojectedReservoirs(RenderContext* pRenderContext, const RenderData& renderData)
@@ -1926,8 +2017,13 @@ void ReservoirSplatting::visualizeForwardReprojection(RenderContext* pRenderCont
 
 void ReservoirSplatting::gatherTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto vars = mpGatherTemporalResamplingPass->pVars->getRootVar();
+    auto vars = mpGatherTemporalResamplingPass->getRootVar();
     vars["gGatherData"] = mpGatherDataBlock;
+    vars["gPathTracer"] = mpPathTracerBlock;
+    vars["gCameraManager"] = mpCameraManagerBlock;
+
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
 
     auto var = vars["CB"]["gGatherTemporalResampling"];
     var["params"].setBlob(mParams);
@@ -1937,13 +2033,21 @@ void ReservoirSplatting::gatherTemporalResampling(RenderContext* pRenderContext,
     var["prevReconnectionData"] = mpIntermediateReconnectionData;
     var["currReconnectionData"] = mpCurrReconnectionData;
     var["vbuffer"] = renderData.getTexture(kInputVBuffer);
+    mpPixelStats->prepareProgram(mpGatherTemporalResamplingPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpGatherTemporalResamplingPass->getProgram(), vars);
 
-    tracePass(pRenderContext, renderData, *mpGatherTemporalResamplingPass);
+    mpGatherTemporalResamplingPass->execute(pRenderContext, {mParams.frameDim, 1});
 }
 
 void ReservoirSplatting::scatterTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto var = mpScatterTemporalResamplingPass->pVars->getRootVar()["CB"]["gScatterTemporalResampling"];
+    auto vars = mpScatterTemporalResamplingPass->getRootVar();
+    vars["gPathTracer"] = mpPathTracerBlock;
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
+
+    auto var  = vars["CB"]["gScatterTemporalResampling"];
     var["params"].setBlob(mParams);
     var["motionVectors"] = renderData.getTexture(kInputMotionVectors);
     var["useConfidenceWeights"] = mReSTIRParams.useConfidenceWeightsTemporally;
@@ -1955,12 +2059,21 @@ void ReservoirSplatting::scatterTemporalResampling(RenderContext* pRenderContext
     var["prevReconnectionData"] = mpPrevReconnectionData;
     var["currReconnectionData"] = mpCurrReconnectionData;
 
-    tracePass(pRenderContext, renderData, *mpScatterTemporalResamplingPass);
+    mpPixelStats->prepareProgram(mpScatterTemporalResamplingPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpScatterTemporalResamplingPass->getProgram(), vars);
+
+    mpScatterTemporalResamplingPass->execute(pRenderContext, {mParams.frameDim, 1});
 }
 
 void ReservoirSplatting::multiScatterTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto var = mpMultiScatterTemporalResamplingPass->pVars->getRootVar()["CB"]["gMultiScatterTemporalResampling"];
+    auto vars = mpMultiScatterTemporalResamplingPass->getRootVar();
+    vars["gPathTracer"] = mpPathTracerBlock;
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
+
+    auto var = vars["CB"]["gMultiScatterTemporalResampling"];
     var["params"].setBlob(mParams);
     var["motionVectors"] = renderData.getTexture(kInputMotionVectors);
     var["useConfidenceWeights"] = mReSTIRParams.useConfidenceWeightsTemporally;
@@ -1971,19 +2084,25 @@ void ReservoirSplatting::multiScatterTemporalResampling(RenderContext* pRenderCo
         var["cellOffsets"][i] = mMultiCellOffsets[i];
         var["sortedReservoirs"][i] = mMultiSortedReservoirs[i];
     }
-  
+
     var["prevReservoirs"] = mpPrevReservoirs;
     var["currReservoirs"] = mpCurrReservoirs;
     var["prevReconnectionData"] = mpPrevReconnectionData;
     var["currReconnectionData"] = mpCurrReconnectionData;
+    mpPixelStats->prepareProgram(mpMultiScatterTemporalResamplingPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpMultiScatterTemporalResamplingPass->getProgram(), vars);
 
-    tracePass(pRenderContext, renderData, *mpMultiScatterTemporalResamplingPass);
+    mpMultiScatterTemporalResamplingPass->execute(pRenderContext, {mParams.frameDim, 1});
 }
 
 void ReservoirSplatting::scatterBackupTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto vars = mpScatterBackupTemporalResamplingPass->pVars->getRootVar();
+    auto vars = mpScatterBackupTemporalResamplingPass->getRootVar();
+    vars["gPathTracer"] = mpPathTracerBlock;
+    vars["gCameraManager"] = mpCameraManagerBlock;
     vars["gGatherData"] = mpGatherDataBlock;
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
 
     auto var = vars["CB"]["gScatterBackupTemporalResampling"];
     var["params"].setBlob(mParams);
@@ -1999,12 +2118,61 @@ void ReservoirSplatting::scatterBackupTemporalResampling(RenderContext* pRenderC
     var["prevReconnectionData"] = mpPrevReconnectionData;
     var["currReconnectionData"] = mpCurrReconnectionData;
 
-    tracePass(pRenderContext, renderData, *mpScatterBackupTemporalResamplingPass);
+    mpPixelStats->prepareProgram(mpScatterBackupTemporalResamplingPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpScatterBackupTemporalResamplingPass->getProgram(), vars);
+
+    mpScatterBackupTemporalResamplingPass->execute(pRenderContext, {mParams.frameDim, 1u});
+}
+
+void ReservoirSplatting::randomReplayTemporalSamples(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    auto rootVar = mpRandomReplayTemporalSamplesPass->getRootVar();
+    auto var = rootVar["CB"]["gRandomReplayTemporalSamples"];//pVars->getRootVar()["CB"]["gInitialCandidates"];
+    mpScene->bindShaderData(rootVar["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, rootVar["gScene"]);
+    var["params"].setBlob(mParams);
+    var["currReservoirs"] = mpCurrReservoirs;
+    var["currReconnectionData"] = mpCurrReconnectionData;
+    var["prevReservoirs"] = mpPrevReservoirs;
+    var["prevReconnectionData"] = mpPrevReconnectionData;
+    var["shiftedPathDataBuffer"] = mpShiftedPaths;
+    rootVar["gPathTracer"] = mpPathTracerBlock;
+    rootVar["gCameraManager"] = mpCameraManagerBlock;
+    mpPixelStats->prepareProgram(mpRandomReplayTemporalSamplesPass->getProgram(), rootVar);
+    mpPixelDebug->prepareProgram(mpRandomReplayTemporalSamplesPass->getProgram(), rootVar);
+    mpRandomReplayTemporalSamplesPass->execute(pRenderContext, {mParams.frameDim.x, mParams.frameDim.y, 1});
+}
+
+void ReservoirSplatting::randomReplayTemporalResampling(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    auto vars = mpRandomReplayTemporalResamplingPass->getRootVar();
+    vars["gPathTracer"] = mpPathTracerBlock;
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
+    auto var = vars["CB"]["gRandomReplayTemporalResampling"];
+    var["params"].setBlob(mParams);
+    var["useConfidenceWeights"] = mReSTIRParams.useConfidenceWeightsTemporally;
+    var["prevReservoirs"] = mpPrevReservoirs;
+    var["currReservoirs"] = mpCurrReservoirs;
+    var["prevReconnectionData"] = mpPrevReconnectionData;
+    var["currReconnectionData"] = mpCurrReconnectionData;
+    var["shiftedPathDataBuffer"] = mpShiftedPaths;
+    mpPixelStats->prepareProgram(mpRandomReplayTemporalResamplingPass->getProgram(), vars);
+    mpPixelDebug->prepareProgram(mpRandomReplayTemporalResamplingPass->getProgram(), vars);
+
+    mpRandomReplayTemporalResamplingPass->execute(pRenderContext, {mParams.frameDim.x, mParams.frameDim.y, 1});
 }
 
 void ReservoirSplatting::spatialResampling(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    auto var = mpSpatialResamplingPass->pVars->getRootVar()["CB"]["gSpatialResampling"];
+    auto vars = mpSpatialResamplingPass->getRootVar();
+    vars["gCameraManager"] = mpCameraManagerBlock;
+    vars["gPathTracer"] = mpPathTracerBlock;
+    mpScene->bindShaderData(vars["gScene"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, vars["gScene"]);
+
+    auto var  = vars["CB"]["gSpatialResampling"];
     var["params"].setBlob(mParams);
     var["useConfidenceWeights"] = mReSTIRParams.useConfidenceWeightsSpatially;
     var["neighborCount"] = mReSTIRParams.neighborCount;
@@ -2026,7 +2194,10 @@ void ReservoirSplatting::spatialResampling(RenderContext* pRenderContext, const 
         var["currReconnectionData"] = mpCurrReconnectionData;
         var["vbuffer"] = renderData.getTexture(kInputVBuffer);
 
-        tracePass(pRenderContext, renderData, *mpSpatialResamplingPass);
+        mpPixelStats->prepareProgram(mpSpatialResamplingPass->getProgram(), vars);
+        mpPixelDebug->prepareProgram(mpSpatialResamplingPass->getProgram(), vars);
+
+        mpSpatialResamplingPass->execute(pRenderContext, {mParams.frameDim, 1u});
     }
 }
 
@@ -2059,9 +2230,6 @@ DefineList ReservoirSplatting::StaticParams::getDefines(const ReservoirSplatting
     defines.add("MAX_SPECULAR_BOUNCES", std::to_string(maxSpecularBounces));
     defines.add("MAX_TRANSMISSON_BOUNCES", std::to_string(maxTransmissionBounces));
     defines.add("ADJUST_SHADING_NORMALS", adjustShadingNormals ? "1" : "0");
-    defines.add("USE_BSDF_SAMPLING", useBSDFSampling ? "1" : "0");
-    defines.add("USE_NEE", useNEE ? "1" : "0");
-    defines.add("USE_MIS", useMIS ? "1" : "0");
     defines.add("USE_RUSSIAN_ROULETTE", useRussianRoulette ? "1" : "0");
     defines.add("USE_ALPHA_TEST", useAlphaTest ? "1" : "0");
     defines.add("USE_LIGHTS_IN_DIELECTRIC_VOLUMES", useLightsInDielectricVolumes ? "1" : "0");

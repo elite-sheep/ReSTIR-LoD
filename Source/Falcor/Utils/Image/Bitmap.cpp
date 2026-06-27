@@ -259,26 +259,33 @@ static FIBITMAP* convertToRGBA16Float(FIBITMAP* pDib)
     auto pNew = FreeImage_AllocateT(FIT_RGBA16, width, height);
     FreeImage_CloneMetadata(pNew, pDib);
 
-    const uint32_t src_pitch = FreeImage_GetPitch(pDib);
+    // const uint32_t src_pitch = FreeImage_GetPitch(pDib);
     const uint32_t dst_pitch = FreeImage_GetPitch(pNew);
 
     const BYTE* src_bits = (BYTE*)FreeImage_GetBits(pDib);
     BYTE* dst_bits = (BYTE*)FreeImage_GetBits(pNew);
 
+    auto readFloat32 = [](const BYTE* ptr) -> float {
+        float value;
+        memcpy(&value, ptr, sizeof(float));
+        return value;
+    };
+
     for (uint32_t y = 0; y < height; y++)
     {
-        const FIRGBAF* src_pixel = (FIRGBAF*)src_bits;
+        // const FIRGBAF* src_pixel = (FIRGBAF*)src_bits;
         FIRGBA16* dst_pixel = (tagFIRGBA16*)dst_bits;
 
         for (uint32_t x = 0; x < width; x++)
         {
             // Convert pixels to float16_t directly, while adding a "dummy" alpha of 1.0 if source format doesn't have alpha.
-            dst_pixel[x].red = float16_t(src_pixel[x].red).toBits();
-            dst_pixel[x].green = float16_t(src_pixel[x].green).toBits();
-            dst_pixel[x].blue = float16_t(src_pixel[x].blue).toBits();
-            dst_pixel[x].alpha = float16_t(type == FIT_RGBAF ? src_pixel[x].alpha : 1.0f).toBits();
+            dst_pixel[x].red   = float16_t(readFloat32(src_bits)).toBits();
+            dst_pixel[x].green = float16_t(readFloat32(src_bits + sizeof(float))).toBits();
+            dst_pixel[x].blue  = float16_t(readFloat32(src_bits + 2 * sizeof(float))).toBits();
+            dst_pixel[x].alpha = float16_t(type == FIT_RGBAF ? readFloat32(src_bits + 3 * sizeof(float)) : 1.0f).toBits();
+            src_bits += (type == FIT_RGBAF) ? 4 * sizeof(float) : 3 * sizeof(float);
         }
-        src_bits += src_pitch;
+        // src_bits += src_pitch;
         dst_bits += dst_pitch;
     }
     return pNew;

@@ -72,6 +72,7 @@ namespace Falcor
         const std::string kMeshBufferName = "meshes";
         const std::string kIndexBufferName = "indexData";
         const std::string kVertexBufferName = "vertices";
+        const std::string kUVVertexBufferName = "uvVertices";
         const std::string kPrevVertexBufferName = "prevVertices";
         const std::string kProceduralPrimAABBBufferName = "proceduralPrimitiveAABBs";
         const std::string kCurveBufferName = "curves";
@@ -211,11 +212,16 @@ namespace Falcor
 
         mMeshIndexData = std::move(sceneData.meshIndexData);
         mMeshStaticData = std::move(sceneData.meshStaticData);
+        mMeshUVStaticData = std::move(sceneData.meshUVStaticData);
 
         mMeshIndexData.setBufferCountDefinePrefix("SCENE_INDEX");
         mMeshIndexData.createGpuBuffers(mpDevice, ResourceBindFlags::Index | ResourceBindFlags::ShaderResource);
         mMeshStaticData.setBufferCountDefinePrefix("SCENE_VERTEX");
         mMeshStaticData.createGpuBuffers(mpDevice, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::Vertex);
+        mMeshUVStaticData.setBufferCountDefinePrefix("SCENE_UV_VERTEX");
+        mMeshUVStaticData.createGpuBuffers(mpDevice, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess | ResourceBindFlags::Vertex);
+
+        mInstanceIDToLoDIndex = std::move(sceneData.instanceIDToLoDIndex);
 
         // Setup additional resources.
         mFrontClockwiseRS[RasterizerState::CullMode::None] = RasterizerState::create(RasterizerState::Desc().setFrontCounterCW(false).setCullMode(RasterizerState::CullMode::None));
@@ -267,6 +273,7 @@ namespace Falcor
         // Must be placed after curve data/AABB creation.
         mpAnimationController->addAnimatedVertexCaches(std::move(sceneData.cachedCurves), std::move(sceneData.cachedMeshes));
 
+        initLoDInfo(sceneData);
         // Finalize scene.
         finalize();
     }
@@ -292,6 +299,7 @@ namespace Falcor
         defines.add("SCENE_HAS_32BIT_INDICES", mHas32BitIndices ? "1" : "0");
         mMeshIndexData.getShaderDefines(defines);
         mMeshStaticData.getShaderDefines(defines);
+        mMeshUVStaticData.getShaderDefines(defines);
 
         defines.add(mHitInfo.getDefines());
         defines.add(getSceneSDFGridDefines());
@@ -828,6 +836,7 @@ namespace Falcor
         if (hasIndexBuffer())
             mMeshIndexData.bindShaderData(var[kIndexBufferName]);
         mMeshStaticData.bindShaderData(var[kVertexBufferName]);
+        mMeshUVStaticData.bindShaderData(var[kUVVertexBufferName]);
         var[kPrevVertexBufferName] = mpAnimationController->getPrevVertexData();
 
         if (mpCurveVao != nullptr)
@@ -1287,7 +1296,49 @@ namespace Falcor
         updateSceneDefines();
         FALCOR_CHECK(mSceneDefines == mPrevSceneDefines, "Scene defines changed unexpectedly");
 
+        mpPrevLoDLevelsBuffer = mpDevice->createBuffer(sizeof(int) * mLoDLevels.size(),
+                                            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                                            MemoryType::DeviceLocal,
+                                            mLoDLevels.data());
+
+        mpLoDLevelsBuffer     = mpDevice->createBuffer(sizeof(int) * mLoDLevels.size(),
+                                            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                                            MemoryType::DeviceLocal,
+                                            mLoDLevels.data());
+
+        mpInstanceIDToLoDIndexBuffer = mpDevice->createBuffer(sizeof(int) * mInstanceIDToLoDIndex.size(),
+                                            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                                            MemoryType::DeviceLocal,
+                                            mInstanceIDToLoDIndex.data());
+        auto var = mpSceneBlock->getRootVar();
+        var["instanceIDToLoDIndex"] = mpInstanceIDToLoDIndexBuffer;
+
         mFinalized = true;
+    }
+
+    void Scene::initLoDInfo(SceneData& sceneData)
+    {
+        mLoDNameToIndex = std::move(sceneData.loDNameToIndex);
+
+        logInfo("Scene has {} LoD levels.", mLoDNameToIndex.size());
+        for (auto iter = mLoDNameToIndex.begin(); iter != mLoDNameToIndex.end(); ++iter)
+        {
+            logInfo("  LoD '{}' -> index {}", iter->first, iter->second);
+        }
+
+        mLoDLevels.resize(sceneData.meshInstanceData.size());
+        for (uint32_t i = 0; i < mInstanceIDToLoDIndex.size(); ++i)
+        {
+            mLoDLevels[i] = -1;
+        }
+        for (uint32_t meshID = 0; meshID < sceneData.meshIDToLoDIndex.size(); ++meshID)
+        {
+            int lodIndex = sceneData.meshIDToLoDIndex[meshID];
+            if (lodIndex != meshID || mLoDLevels[lodIndex] >= 0)
+            {
+                mLoDLevels[lodIndex] = 0;
+            }
+        }
     }
 
     void Scene::initializeCameras()
@@ -1870,6 +1921,9 @@ namespace Falcor
             mpSceneBlock = nullptr;
         }
 
+        // auto curLevel = mLoDLevels[mLoDNameToIndex.at("GoldKnight")];
+        // setLoDLevel("GoldKnight", curLevel == 0 ? 3 : 0); // Example of linking LoD levels
+
         // Recreate scene parameter block if scene defines changed, as the defines may affect resource declarations.
         // All access to the (new) scene parameter block should be placed after this point.
         if (!mpSceneBlock)
@@ -1926,6 +1980,18 @@ namespace Falcor
             buildBlas(pRenderContext);
         }
 
+        // Set geometry moved flag for shaders.
+        mpSceneBlock->getRootVar()["isGeometryMoved"] = is_set(mUpdates, IScene::UpdateFlags::GeometryMoved);
+
+        // If the LoD information changes, we need to rebuild the TLAS
+        mpSceneBlock->getRootVar()["isLoDChanged"] = mIsLoDChanged;
+        if (mIsLoDChanged)
+        {
+            invalidateTlasCache();
+            invalidateUVTlasCache();
+            mIsLoDChanged = false;
+        }
+
         // Update light collection
         if (mpLightCollection)
         {
@@ -1960,6 +2026,15 @@ namespace Falcor
             mUpdates |= IScene::UpdateFlags::SDFGridConfigChanged;
             mPrevSDFGridConfig = mSDFGridConfig;
         }
+
+        std::swap(mpLoDLevelsBuffer, mpPrevLoDLevelsBuffer);
+        mpLoDLevelsBuffer     = mpDevice->createBuffer(sizeof(int) * mLoDLevels.size(),
+                                            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                                            MemoryType::DeviceLocal,
+                                            mLoDLevels.data());
+        mpSceneBlock->getRootVar()["maxLoDLevel"] = 1;
+        mpSceneBlock->getRootVar()["loDLevels"] = mpLoDLevelsBuffer;
+        mpSceneBlock->getRootVar()["prevLoDLevels"] = mpPrevLoDLevelsBuffer;
 
         // Validate assumption that scene defines didn't change.
         updateSceneDefines();
@@ -2444,7 +2519,7 @@ namespace Falcor
     {
         mRecordedFrameCount = 0;
     }
-    
+
     bool Scene::isReplaying()
     {
         return mReplayUserInteraction;
@@ -3384,6 +3459,583 @@ namespace Falcor
         FALCOR_ASSERT(blasIDs.size() == mBlasData.size());
     }
 
+    void Scene::initUVGeomDesc(RenderContext* pRenderContext)
+    {
+        // This function initializes all geometry descs to prepare for BLAS build.
+        // If the scene has no geometries the 'mBlasData' array will be left empty.
+
+        // First compute total number of BLASes to build:
+        // - Triangle meshes have been grouped beforehand and we build one BLAS per mesh group.
+        // - Curves and procedural primitives are currently placed in a single BLAS each, if they exist.
+        // - SDF grids are placed in individual BLASes.
+        const uint32_t totalBlasCount = (uint32_t)mMeshGroups.size();
+
+        mUVBlasData.clear();
+        mUVBlasData.resize(totalBlasCount);
+        mRebuildBlas = true;
+
+        if (!mMeshGroups.empty())
+        {
+            const auto& globalMatrices = mpAnimationController->getGlobalMatrices();
+
+            // Normally static geometry is already pre-transformed to world space by the SceneBuilder,
+            // but if that isn't the case, we let DXR transform static geometry as part of the BLAS build.
+            // For this we need the GPU address of the transform matrix of each mesh in row-major format.
+            // Since glm uses column-major format we lazily create a buffer with the transposed matrices.
+            // Note that this is sufficient to do once only as the transforms for static meshes can't change.
+            // TODO: Use AnimationController's matrix buffer directly when we've switched to a row-major matrix library.
+            // auto getStaticMatricesBuffer = [&]()
+            // {
+            //     if (!mpBlasStaticWorldMatrices)
+            //     {
+            //         std::vector<float4x4> transposedMatrices;
+            //         transposedMatrices.reserve(globalMatrices.size());
+            //         for (const auto& m : globalMatrices) transposedMatrices.push_back(transpose(m));
+
+            //         uint32_t float4Count = (uint32_t)transposedMatrices.size() * 4;
+            //         mpBlasStaticWorldMatrices = mpDevice->createStructuredBuffer(sizeof(float4), float4Count, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, transposedMatrices.data(), false);
+            //         mpBlasStaticWorldMatrices->setName("Scene::mpBlasStaticWorldMatrices");
+
+            //         // Transition the resource to non-pixel shader state as expected by DXR.
+            //         pRenderContext->resourceBarrier(mpBlasStaticWorldMatrices.get(), Resource::State::NonPixelShader);
+            //     }
+            //     return mpBlasStaticWorldMatrices;
+            // };
+
+            // Iterate over the mesh groups. One BLAS will be created for each group.
+            // Each BLAS may contain multiple geometries.
+            for (size_t i = 0; i < mMeshGroups.size(); i++)
+            {
+                const auto& meshList = mMeshGroups[i].meshList;
+                const bool isStatic = mMeshGroups[i].isStatic;
+                const bool isDisplaced = mMeshGroups[i].isDisplaced;
+                auto& blas = mUVBlasData[i];
+                auto& geomDescs = blas.geomDescs;
+                geomDescs.resize(meshList.size());
+                blas.hasProceduralPrimitives = false;
+
+                // Track what types of triangle winding exist in the final BLAS.
+                // The SceneBuilder should have ensured winding is consistent, but keeping the check here as a safeguard.
+                uint32_t triangleWindings = 0; // bit 0 indicates CW, bit 1 CCW.
+
+                for (size_t j = 0; j < meshList.size(); j++)
+                {
+                    const MeshID meshID = meshList[j];
+                    const MeshDesc& mesh = mMeshDesc[meshID.get()];
+                    bool frontFaceCW = mesh.isFrontFaceCW();
+                    blas.hasDynamicMesh |= mesh.isDynamic();
+
+                    RtGeometryDesc& desc = geomDescs[j];
+
+                    if (!isDisplaced)
+                    {
+                        desc.type = RtGeometryType::Triangles;
+                        desc.content.triangles.transform3x4 = 0; // The default is no transform
+
+                        // if (isStatic)
+                        // {
+                        //     // Static meshes will be pre-transformed when building the BLAS.
+                        //     // Lookup the matrix ID here. If it is an identity matrix, no action is needed.
+                        //     FALCOR_ASSERT(mMeshIdToInstanceIds[meshID.get()].size() == 1);
+                        //     uint32_t instanceID = mMeshIdToInstanceIds[meshID.get()][0];
+                        //     FALCOR_ASSERT(instanceID < mGeometryInstanceData.size());
+                        //     uint32_t matrixID = mGeometryInstanceData[instanceID].globalMatrixID;
+
+                        //     FALCOR_ASSERT(matrixID < globalMatrices.size());
+                        //     if (globalMatrices[matrixID] != float4x4::identity())
+                        //     {
+                        //         // Get the GPU address of the transform in row-major format.
+                        //         desc.content.triangles.transform3x4 = getStaticMatricesBuffer()->getGpuAddress() + matrixID * 64ull;
+
+                        //         if (determinant(globalMatrices[matrixID]) < 0.f) frontFaceCW = !frontFaceCW;
+                        //     }
+                        // }
+                        // triangleWindings |= frontFaceCW ? 1 : 2;
+
+                        // If this is an opaque mesh, set the opaque flag
+                        desc.flags = RtGeometryFlags::None;
+
+                        // Set the position data
+                        desc.content.triangles.vertexData = mMeshUVStaticData.getGpuAddress(mesh.vbOffset);
+                        desc.content.triangles.vertexStride = sizeof(PackedStaticVertexData);
+                        desc.content.triangles.vertexCount = mesh.vertexCount;
+                        desc.content.triangles.vertexFormat = ResourceFormat::RGB32Float;
+
+                        // Set index data
+                        if (!mMeshIndexData.empty())
+                        {
+                            // The global index data is stored in a dword array.
+                            // Each mesh specifies whether its indices are in 16-bit or 32-bit format.
+                            ResourceFormat ibFormat = mesh.use16BitIndices() ? ResourceFormat::R16Uint : ResourceFormat::R32Uint;
+                            desc.content.triangles.indexData = mMeshIndexData.getGpuAddress(mesh.ibOffset);
+                            desc.content.triangles.indexCount = mesh.indexCount;
+                            desc.content.triangles.indexFormat = ibFormat;
+                        }
+                        else
+                        {
+                            FALCOR_ASSERT(mesh.indexCount == 0);
+                            desc.content.triangles.indexData = 0;
+                            desc.content.triangles.indexCount = 0;
+                            desc.content.triangles.indexFormat = ResourceFormat::Unknown;
+                        }
+                    }
+                    // else
+                    // {
+                    //     // Displaced triangle mesh, requires custom intersection.
+                    //     // desc.type = RtGeometryType::ProcedurePrimitives;
+                    //     // desc.flags = RtGeometryFlags::Opaque;
+
+                    //     // desc.content.proceduralAABBs.count = mDisplacement.meshData[meshID.get()].AABBCount;
+                    //     // uint64_t bbStartOffset = mDisplacement.meshData[meshID.get()].AABBOffset * sizeof(RtAABB);
+                    //     // desc.content.proceduralAABBs.data = mDisplacement.pAABBBuffer->getGpuAddress() + bbStartOffset;
+                    //     // desc.content.proceduralAABBs.stride = sizeof(RtAABB);
+                    // }
+                }
+
+                FALCOR_ASSERT(!(isStatic && blas.hasDynamicMesh));
+
+                if (triangleWindings == 0x3)
+                {
+                    logWarning("Mesh group {} has mixed triangle winding. Back/front face culling won't work correctly.", i);
+                }
+            }
+        }
+
+        // Verify that the total geometry count matches the expectation.
+        size_t totalGeometries = 0;
+        for (const auto& blas : mUVBlasData) totalGeometries += blas.geomDescs.size();
+        if (totalGeometries != getGeometryCount()) FALCOR_THROW("Total geometry count mismatch");
+
+        mBlasDataValid = true;
+    }
+
+    void Scene::prepareUVPrebuildInfo(RenderContext* pRenderContext)
+    {
+        for (auto& blas : mUVBlasData)
+        {
+            // Determine how BLAS build/update should be done.
+            // The default choice is to compact all static BLASes and those that don't need to be rebuilt every frame.
+            // For all other BLASes, compaction just adds overhead.
+            // TODO: Add compaction on/off switch for profiling.
+            // TODO: Disable compaction for skinned meshes if update performance becomes a problem.
+            blas.updateMode = mBlasUpdateMode;
+            blas.useCompaction = (!blas.hasDynamicGeometry()) || blas.updateMode != UpdateMode::Rebuild;
+
+            // Setup build parameters.
+            RtAccelerationStructureBuildInputs& inputs = blas.buildInputs;
+            inputs.kind = RtAccelerationStructureKind::BottomLevel;
+            inputs.descCount = (uint32_t)blas.geomDescs.size();
+            inputs.geometryDescs = blas.geomDescs.data();
+            inputs.flags = RtAccelerationStructureBuildFlags::None;
+
+            // Add necessary flags depending on settings.
+            if (blas.useCompaction)
+            {
+                inputs.flags |= RtAccelerationStructureBuildFlags::AllowCompaction;
+            }
+            if ((blas.hasDynamicGeometry() || blas.hasProceduralPrimitives) && blas.updateMode == UpdateMode::Refit)
+            {
+                inputs.flags |= RtAccelerationStructureBuildFlags::AllowUpdate;
+            }
+            // Set optional performance hints.
+            // TODO: Set FAST_BUILD for skinned meshes if update/rebuild performance becomes a problem.
+            // TODO: Add FAST_TRACE on/off switch for profiling. It is disabled by default as it is scene-dependent.
+            //if (!blas.hasSkinnedMesh)
+            //{
+            //    inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+            //}
+
+            if (blas.hasDynamicGeometry())
+            {
+                inputs.flags |= RtAccelerationStructureBuildFlags::PreferFastBuild;
+            }
+
+            // Get prebuild info.
+            blas.prebuildInfo = RtAccelerationStructure::getPrebuildInfo(mpDevice.get(), inputs);
+
+            // Figure out the padded allocation sizes to have proper alignment.
+            FALCOR_ASSERT(blas.prebuildInfo.resultDataMaxSize > 0);
+            blas.resultByteSize = align_to(kAccelerationStructureByteAlignment, blas.prebuildInfo.resultDataMaxSize);
+
+            uint64_t scratchByteSize = std::max(blas.prebuildInfo.scratchDataSize, blas.prebuildInfo.updateScratchDataSize);
+            blas.scratchByteSize = align_to(kAccelerationStructureByteAlignment, scratchByteSize);
+        }
+    }
+
+    void Scene::computeUVBlasGroups()
+    {
+        mUVBlasGroups.clear();
+        uint64_t groupSize = 0;
+
+        for (uint32_t blasId = 0; blasId < mUVBlasData.size(); blasId++)
+        {
+            auto& blas = mUVBlasData[blasId];
+            size_t blasSize = blas.resultByteSize + blas.scratchByteSize;
+
+            // Start new BLAS group on first iteration or if group size would exceed the target.
+            if (groupSize == 0 || groupSize + blasSize > kMaxBLASBuildMemory)
+            {
+                mUVBlasGroups.push_back({});
+                groupSize = 0;
+            }
+
+            // Add BLAS to current group.
+            FALCOR_ASSERT(mUVBlasGroups.size() > 0);
+            auto& group = mUVBlasGroups.back();
+            group.blasIndices.push_back(blasId);
+            blas.blasGroupIndex = (uint32_t)mUVBlasGroups.size() - 1;
+
+            // Update data offsets and sizes.
+            blas.resultByteOffset = group.resultByteSize;
+            blas.scratchByteOffset = group.scratchByteSize;
+            group.resultByteSize += blas.resultByteSize;
+            group.scratchByteSize += blas.scratchByteSize;
+
+            groupSize += blasSize;
+        }
+
+        // Validation that all offsets and sizes are correct.
+        uint64_t totalResultSize = 0;
+        uint64_t totalScratchSize = 0;
+        std::set<uint32_t> blasIDs;
+
+        for (size_t blasGroupIndex = 0; blasGroupIndex < mUVBlasGroups.size(); blasGroupIndex++)
+        {
+            uint64_t resultSize = 0;
+            uint64_t scratchSize = 0;
+
+            const auto& group = mUVBlasGroups[blasGroupIndex];
+            FALCOR_ASSERT(!group.blasIndices.empty());
+
+            for (auto blasId : group.blasIndices)
+            {
+                FALCOR_ASSERT(blasId < mBlasData.size());
+                const auto& blas = mUVBlasData[blasId];
+
+                FALCOR_ASSERT(blasIDs.insert(blasId).second);
+                FALCOR_ASSERT(blas.blasGroupIndex == blasGroupIndex);
+
+                FALCOR_ASSERT(blas.resultByteSize > 0);
+                FALCOR_ASSERT(blas.resultByteOffset == resultSize);
+                resultSize += blas.resultByteSize;
+
+                FALCOR_ASSERT(blas.scratchByteSize > 0);
+                FALCOR_ASSERT(blas.scratchByteOffset == scratchSize);
+                scratchSize += blas.scratchByteSize;
+
+                FALCOR_ASSERT(blas.blasByteOffset == 0);
+                FALCOR_ASSERT(blas.blasByteSize == 0);
+            }
+
+            FALCOR_ASSERT(resultSize == group.resultByteSize);
+            FALCOR_ASSERT(scratchSize == group.scratchByteSize);
+        }
+        FALCOR_ASSERT(blasIDs.size() == mBlasData.size());
+    }
+
+    void Scene::buildUVBlas(RenderContext* pRenderContext)
+    {
+        FALCOR_PROFILE(pRenderContext, "buildUVBlas");
+
+        if (!mBlasDataValid) FALCOR_THROW("buildBlas() BLAS data is invalid");
+        if (!pRenderContext->getDevice()->isFeatureSupported(Device::SupportedFeatures::Raytracing))
+        {
+            FALCOR_THROW("Raytracing is not supported by the current device");
+        }
+
+        // Add barriers for the VB and IB which will be accessed by the build.
+        for (size_t i = 0; i < mMeshUVStaticData.getBufferCount(); ++i)
+        {
+            ref<Buffer> pVb = mMeshUVStaticData.getGpuBuffer(i);
+            if (pVb)
+                pRenderContext->resourceBarrier(pVb.get(), Resource::State::NonPixelShader);
+        }
+
+        for (size_t i = 0; i < mMeshIndexData.getBufferCount(); ++i)
+        {
+            ref<Buffer> pIb = mMeshIndexData.getGpuBuffer(i);
+            if (pIb)
+                pRenderContext->resourceBarrier(pIb.get(), Resource::State::NonPixelShader);
+        }
+
+        // if (mpRtAABBBuffer)
+        // {
+        //     pRenderContext->resourceBarrier(mpRtAABBBuffer.get(), Resource::State::NonPixelShader);
+        // }
+
+        // On the first time, or if a full rebuild is necessary we will:
+        // - Update all build inputs and prebuild info
+        // - Compute BLAS groups
+        // - Calculate total intermediate buffer sizes
+        // - Build all BLASes into an intermediate buffer
+        // - Calculate total compacted buffer size
+        // - Compact/clone all BLASes to their final location
+
+        if (mRebuildBlas)
+        {
+            // Invalidate any previous TLASes as they won't be valid anymore.
+            // invalidateTlasCache();
+
+            if (mUVBlasData.empty())
+            {
+                logInfo("Skipping UVBLAS build due to no geometries");
+
+                mUVBlasGroups.clear();
+                mUVBlasObjects.clear();
+            }
+            else
+            {
+                logInfo("Initiating BLAS build for {} mesh groups", mUVBlasData.size());
+
+                // Compute pre-build info per BLAS and organize the BLASes into groups
+                // in order to limit GPU memory usage during BLAS build.
+                prepareUVPrebuildInfo(pRenderContext);
+                computeUVBlasGroups();
+
+                logInfo("BLAS build split into {} groups", mBlasGroups.size());
+
+                // Compute the required maximum size of the result and scratch buffers.
+                uint64_t resultByteSize = 0;
+                uint64_t scratchByteSize = 0;
+                size_t maxBlasCount = 0;
+
+                for (const auto& group : mUVBlasGroups)
+                {
+                    resultByteSize = std::max(resultByteSize, group.resultByteSize);
+                    scratchByteSize = std::max(scratchByteSize, group.scratchByteSize);
+                    maxBlasCount = std::max(maxBlasCount, group.blasIndices.size());
+                }
+                FALCOR_ASSERT(resultByteSize > 0 && scratchByteSize > 0);
+
+                logInfo("BLAS build result buffer size: {}", formatByteSize(resultByteSize));
+                logInfo("BLAS build scratch buffer size: {}", formatByteSize(scratchByteSize));
+
+                // Allocate result and scratch buffers.
+                // The scratch buffer we'll retain because it's needed for subsequent rebuilds and updates.
+                // TODO: Save memory by reducing the scratch buffer to the minimum required for the dynamic objects.
+                if (mpUVBlasScratch == nullptr || mpUVBlasScratch->getSize() < scratchByteSize)
+                {
+                    mpUVBlasScratch = mpDevice->createBuffer(scratchByteSize, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal);
+                    mpUVBlasScratch->setName("Scene::mpBlasScratch");
+                }
+
+                ref<Buffer> pResultBuffer = mpDevice->createBuffer(resultByteSize, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+                FALCOR_ASSERT(pResultBuffer && mpUVBlasScratch);
+
+                // Create post-build info pool for readback.
+                RtAccelerationStructurePostBuildInfoPool::Desc compactedSizeInfoPoolDesc;
+                compactedSizeInfoPoolDesc.queryType = RtAccelerationStructurePostBuildInfoQueryType::CompactedSize;
+                compactedSizeInfoPoolDesc.elementCount = (uint32_t)maxBlasCount;
+                ref<RtAccelerationStructurePostBuildInfoPool> compactedSizeInfoPool = RtAccelerationStructurePostBuildInfoPool::create(mpDevice.get(), compactedSizeInfoPoolDesc);
+
+                RtAccelerationStructurePostBuildInfoPool::Desc currentSizeInfoPoolDesc;
+                currentSizeInfoPoolDesc.queryType = RtAccelerationStructurePostBuildInfoQueryType::CurrentSize;
+                currentSizeInfoPoolDesc.elementCount = (uint32_t)maxBlasCount;
+                ref<RtAccelerationStructurePostBuildInfoPool> currentSizeInfoPool = RtAccelerationStructurePostBuildInfoPool::create(mpDevice.get(), currentSizeInfoPoolDesc);
+
+                bool hasDynamicGeometry = false;
+                bool hasProceduralPrimitives = false;
+
+                mUVBlasObjects.resize(mUVBlasData.size());
+
+                // Iterate over BLAS groups. For each group build and compact all BLASes.
+                for (size_t blasGroupIndex = 0; blasGroupIndex < mUVBlasGroups.size(); blasGroupIndex++)
+                {
+                    auto& group = mUVBlasGroups[blasGroupIndex];
+
+                    // Allocate array to hold intermediate blases for the group.
+                    std::vector<ref<RtAccelerationStructure>> intermediateBlases(group.blasIndices.size());
+
+                    // Insert barriers. The buffers are now ready to be written.
+                    pRenderContext->uavBarrier(pResultBuffer.get());
+                    pRenderContext->uavBarrier(mpUVBlasScratch.get());
+
+                    // Reset the post-build info pools to receive new info.
+                    compactedSizeInfoPool->reset(pRenderContext);
+                    currentSizeInfoPool->reset(pRenderContext);
+
+                    // Build the BLASes into the intermediate result buffer.
+                    // We output post-build info in order to find out the final size requirements.
+                    for (size_t i = 0; i < group.blasIndices.size(); ++i)
+                    {
+                        const uint32_t blasId = group.blasIndices[i];
+                        const auto& blas = mUVBlasData[blasId];
+
+                        hasDynamicGeometry |= blas.hasDynamicGeometry();
+                        hasProceduralPrimitives |= blas.hasProceduralPrimitives;
+
+                        RtAccelerationStructure::Desc createDesc = {};
+                        createDesc.setBuffer(pResultBuffer, blas.resultByteOffset, blas.resultByteSize);
+                        createDesc.setKind(RtAccelerationStructureKind::BottomLevel);
+                        auto blasObject = RtAccelerationStructure::create(mpDevice, createDesc);
+                        intermediateBlases[i] = blasObject;
+
+                        RtAccelerationStructure::BuildDesc asDesc = {};
+                        asDesc.inputs = blas.buildInputs;
+                        asDesc.scratchData = mpUVBlasScratch->getGpuAddress() + blas.scratchByteOffset;
+                        asDesc.dest = blasObject.get();
+
+                        // Need to find out the post-build compacted BLAS size to know the final allocation size.
+                        RtAccelerationStructurePostBuildInfoDesc postbuildInfoDesc = {};
+                        if (blas.useCompaction)
+                        {
+                            postbuildInfoDesc.type = RtAccelerationStructurePostBuildInfoQueryType::CompactedSize;
+                            postbuildInfoDesc.index = (uint32_t)i;
+                            postbuildInfoDesc.pool = compactedSizeInfoPool.get();
+                        }
+                        else
+                        {
+                            postbuildInfoDesc.type = RtAccelerationStructurePostBuildInfoQueryType::CurrentSize;
+                            postbuildInfoDesc.index = (uint32_t)i;
+                            postbuildInfoDesc.pool = currentSizeInfoPool.get();
+                        }
+
+                        pRenderContext->buildAccelerationStructure(asDesc, 1, &postbuildInfoDesc);
+                        pRenderContext->submit(true);
+                    }
+
+                    // Read back the calculated final size requirements for each BLAS.
+
+                    group.finalByteSize = 0;
+                    for (size_t i = 0; i < group.blasIndices.size(); i++)
+                    {
+                        const uint32_t blasId = group.blasIndices[i];
+                        auto& blas = mUVBlasData[blasId];
+
+                        // Check the size. Upon failure a zero size may be reported.
+                        uint64_t byteSize = 0;
+                        if (blas.useCompaction)
+                        {
+                            byteSize = compactedSizeInfoPool->getElement(pRenderContext, (uint32_t)i);
+                        }
+                        else
+                        {
+                            byteSize = currentSizeInfoPool->getElement(pRenderContext, (uint32_t)i);
+                            // For platforms that does not support current size query, use prebuild size.
+                            if (byteSize == 0)
+                            {
+                                byteSize = blas.prebuildInfo.resultDataMaxSize;
+                            }
+                        }
+                        FALCOR_ASSERT(byteSize <= blas.prebuildInfo.resultDataMaxSize);
+                        if (byteSize == 0) FALCOR_THROW("Acceleration structure build failed for BLAS index {}", blasId);
+
+                        blas.blasByteSize = align_to(kAccelerationStructureByteAlignment, byteSize);
+                        blas.blasByteOffset = group.finalByteSize;
+                        group.finalByteSize += blas.blasByteSize;
+                    }
+                    FALCOR_ASSERT(group.finalByteSize > 0);
+
+                    logInfo("BLAS group " + std::to_string(blasGroupIndex) + " final size: " + formatByteSize(group.finalByteSize));
+
+                    // Allocate final BLAS buffer.
+                    auto& pBlas = group.pBlas;
+                    if (pBlas == nullptr || pBlas->getSize() < group.finalByteSize)
+                    {
+                        pBlas = mpDevice->createBuffer(group.finalByteSize, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+                        pBlas->setName("Scene::mUVBlasGroups[" + std::to_string(blasGroupIndex) + "].pBlas");
+                    }
+                    else
+                    {
+                        // If we didn't need to reallocate, just insert a barrier so it's safe to use.
+                        pRenderContext->uavBarrier(pBlas.get());
+                    }
+
+                    // Insert barrier. The result buffer is now ready to be consumed.
+                    // TOOD: This is probably not necessary since we flushed above, but it's not going to hurt.
+                    pRenderContext->uavBarrier(pResultBuffer.get());
+
+                    // Compact/clone all BLASes to their final location.
+                    for (size_t i = 0; i < group.blasIndices.size(); ++i)
+                    {
+                        const uint32_t blasId = group.blasIndices[i];
+                        auto& blas = mUVBlasData[blasId];
+
+                        RtAccelerationStructure::Desc blasDesc = {};
+                        blasDesc.setBuffer(pBlas, blas.blasByteOffset, blas.blasByteSize);
+                        blasDesc.setKind(RtAccelerationStructureKind::BottomLevel);
+                        mUVBlasObjects[blasId] = RtAccelerationStructure::create(mpDevice, blasDesc);
+
+                        pRenderContext->copyAccelerationStructure(
+                            mUVBlasObjects[blasId].get(),
+                            intermediateBlases[i].get(),
+                            blas.useCompaction ? RenderContext::RtAccelerationStructureCopyMode::Compact : RenderContext::RtAccelerationStructureCopyMode::Clone);
+                    }
+
+                    // Insert barrier. The BLAS buffer is now ready for use.
+                    pRenderContext->uavBarrier(pBlas.get());
+                }
+
+                // Release scratch buffer if there is no animated content. We will not need it.
+                if (!hasDynamicGeometry && !hasProceduralPrimitives) mpUVBlasScratch.reset();
+            }
+
+            // updateRaytracingBLASStats();
+            mRebuildBlas = false;
+            return;
+        }
+
+        // If we get here, all BLASes have previously been built and compacted. We will:
+        // - Skip the ones that have no animated geometries.
+        // - Update or rebuild in-place the ones that are animated.
+
+        FALCOR_ASSERT(!mRebuildBlas);
+        bool updateProcedural = is_set(mUpdates, IScene::UpdateFlags::CurvesMoved) || is_set(mUpdates, IScene::UpdateFlags::CustomPrimitivesMoved);
+
+        for (const auto& group : mBlasGroups)
+        {
+            // Determine if any BLAS in the group needs to be updated.
+            bool needsUpdate = false;
+            for (uint32_t blasId : group.blasIndices)
+            {
+                const auto& blas = mBlasData[blasId];
+                if (blas.hasProceduralPrimitives && updateProcedural) needsUpdate = true;
+                if (!blas.hasProceduralPrimitives && blas.hasDynamicGeometry()) needsUpdate = true;
+            }
+
+            if (!needsUpdate) continue;
+
+            // At least one BLAS in the group needs to be updated.
+            // Insert barriers. The buffers are now ready to be written.
+            auto& pBlas = group.pBlas;
+            FALCOR_ASSERT(pBlas && mpBlasScratch);
+            pRenderContext->uavBarrier(pBlas.get());
+            pRenderContext->uavBarrier(mpBlasScratch.get());
+
+            // Iterate over all BLASes in group.
+            for (uint32_t blasId : group.blasIndices)
+            {
+                const auto& blas = mBlasData[blasId];
+
+                // Skip BLASes that do not need to be updated.
+                if (blas.hasProceduralPrimitives && !updateProcedural) continue;
+                if (!blas.hasProceduralPrimitives && !blas.hasDynamicGeometry()) continue;
+
+                // Rebuild/update BLAS.
+                RtAccelerationStructure::BuildDesc asDesc = {};
+                asDesc.inputs = blas.buildInputs;
+                asDesc.scratchData = mpBlasScratch->getGpuAddress() + blas.scratchByteOffset;
+                asDesc.dest = mBlasObjects[blasId].get();
+
+                if (blas.updateMode == UpdateMode::Refit)
+                {
+                    // Set source address to destination address to update in place.
+                    asDesc.source = asDesc.dest;
+                    asDesc.inputs.flags |= RtAccelerationStructureBuildFlags::PerformUpdate;
+                }
+                else
+                {
+                    // We'll rebuild in place. The BLAS should not be compacted, check that size matches prebuild info.
+                    FALCOR_ASSERT(blas.blasByteSize == blas.prebuildInfo.resultDataMaxSize);
+                }
+                pRenderContext->buildAccelerationStructure(asDesc, 0, nullptr);
+            }
+
+            // Insert barrier. The BLAS buffer is now ready for use.
+            pRenderContext->uavBarrier(pBlas.get());
+        }
+    }
+
     void Scene::buildBlas(RenderContext* pRenderContext)
     {
         FALCOR_PROFILE(pRenderContext, "buildBlas");
@@ -3722,6 +4374,19 @@ namespace Falcor
         {
             const auto& meshList = mMeshGroups[i].meshList;
             const bool isStatic = mMeshGroups[i].isStatic;
+            bool shouldAddToTlas = true;
+            if (meshList.size() == 1) {
+                const auto& meshName = getMeshName(meshList[0].get());
+                if (auto result = parseLodMeshName(meshName)) {
+                    auto& [loDName, loDLevel] = *result;
+                    int curLoDIndex = mLoDNameToIndex.at(loDName);
+                    logInfo("Processing mesh: {} {} {}.", meshName, loDLevel, mLoDLevels[curLoDIndex]);
+                    if (mLoDLevels[curLoDIndex] != loDLevel) {
+                        // Do not include this LoD mesh in the TLAs.
+                        shouldAddToTlas = false;
+                    }
+                }
+            }
 
             FALCOR_ASSERT(mBlasData[i].blasGroupIndex < mBlasGroups.size());
             const auto& pBlas = mBlasGroups[mBlasData[i].blasGroupIndex].pBlas;
@@ -3729,7 +4394,7 @@ namespace Falcor
 
             RtInstanceDesc desc = {};
             desc.accelerationStructure = pBlas->getGpuAddress() + mBlasData[i].blasByteOffset;
-            desc.instanceMask = 0xFF;
+            desc.instanceMask = shouldAddToTlas ? 0xFF : 0x00; // If not adding to TLAS, set mask to 0 to ignore the instance.
             desc.instanceContributionToHitGroupIndex = perMeshHitEntry ? instanceContributionToHitGroupIndex : 0;
 
             instanceContributionToHitGroupIndex += rayTypeCount * (uint32_t)meshList.size();
@@ -3917,11 +4582,16 @@ namespace Falcor
 
     void Scene::invalidateTlasCache()
     {
-        for (auto& tlas : mTlasCache)
+        mFrameIndex = 1 - mFrameIndex;
+        for (uint32_t rtc : mTlasRayTypeCounts)
         {
-            tlas.second.pTlasObject = nullptr;
+            mTlasCache[2 * rtc + mFrameIndex].pTlasObject = nullptr;
         }
-        mTlasLastBuiltRayCount = 0;
+        // for (auto& tlas : mTlasCache)
+        // {
+        //     tlas.second.pTlasObject = nullptr;
+        // }
+        // mTlasLastBuiltRayCount = 0;
     }
 
     void Scene::buildTlas(RenderContext* pRenderContext, uint32_t rayTypeCount, bool perMeshHitEntry)
@@ -3929,7 +4599,7 @@ namespace Falcor
         FALCOR_PROFILE(pRenderContext, "buildTlas");
 
         TlasData tlas;
-        auto it = mTlasCache.find(rayTypeCount);
+        auto it = mTlasCache.find(2 * rayTypeCount + mFrameIndex);
         if (it != mTlasCache.end()) tlas = it->second;
 
         // Prepare instance descs.
@@ -4017,9 +4687,330 @@ namespace Falcor
         pRenderContext->buildAccelerationStructure(asDesc, 0, nullptr);
         pRenderContext->uavBarrier(tlas.pTlasBuffer.get());
 
-        mTlasCache[rayTypeCount] = tlas;
+        mTlasCache[2 * rayTypeCount + mFrameIndex] = tlas;
+        // logInfo("Tlas Cache Index: {}", 2 * rayTypeCount + mFrameIndex);
+        mTlasRayTypeCounts.insert(rayTypeCount);
         updateRaytracingTLASStats();
-        mTlasLastBuiltRayCount = rayTypeCount;
+        // mTlasLastBuiltRayCount = rayTypeCount;
+    }
+
+    void Scene::invalidateUVTlasCache()
+    {
+        for (auto& tlas : mUVTlasCache)
+        {
+            tlas.second.pTlasObject = nullptr;
+        }
+        mUVTlasLastBuiltRayCount = 0;
+    }
+
+    void Scene::fillUVInstanceDesc(std::vector<RtInstanceDesc>& instanceDescs, uint32_t rayTypeCount, bool perMeshHitEntry) const
+    {
+        instanceDescs.clear();
+        uint32_t instanceContributionToHitGroupIndex = 0;
+        uint32_t instanceID = 0;
+
+        for (size_t i = 0; i < mMeshGroups.size(); i++)
+        {
+            const auto& meshList = mMeshGroups[i].meshList;
+            const bool isStatic = mMeshGroups[i].isStatic;
+            uint instanceMask = 0xff;
+            if (meshList.size() == 1) {
+                const auto& meshName = getMeshName(meshList[0].get());
+                logInfo("Processing mesh: {}", meshName);
+                if (auto result = parseLodMeshName(meshName)) {
+                    auto& [loDName, loDLevel] = *result;
+                    instanceMask = (1 << loDLevel);
+                }
+            }
+
+            FALCOR_ASSERT(mUVBlasData[i].blasGroupIndex < mUVBlasGroups.size());
+            const auto& pBlas = mUVBlasGroups[mUVBlasData[i].blasGroupIndex].pBlas;
+            FALCOR_ASSERT(pBlas);
+
+            RtInstanceDesc desc = {};
+            desc.accelerationStructure = pBlas->getGpuAddress() + mUVBlasData[i].blasByteOffset;
+            desc.instanceMask = instanceMask; // If not adding to TLAS, set mask to 0 to ignore the instance.
+            desc.instanceContributionToHitGroupIndex = perMeshHitEntry ? instanceContributionToHitGroupIndex : 0;
+
+            instanceContributionToHitGroupIndex += rayTypeCount * (uint32_t)meshList.size();
+
+            // We expect all meshes in a group to have identical triangle winding. Verify that assumption here.
+            FALCOR_ASSERT(!meshList.empty());
+            const bool frontFaceCW = mMeshDesc[meshList[0].get()].isFrontFaceCW();
+            for (size_t j = 1; j < meshList.size(); j++)
+            {
+                FALCOR_ASSERT(mMeshDesc[meshList[j].get()].isFrontFaceCW() == frontFaceCW);
+            }
+
+            // Set the triangle winding for the instance if it differs from the default.
+            // The default in DXR is that a triangle is front facing if its vertices appear clockwise
+            // from the ray origin, in object space in a left-handed coordinate system.
+            // Note that Falcor uses a right-handed coordinate system, so we have to invert the flag.
+            // Since these winding direction rules are defined in object space, they are unaffected by instance transforms.
+            if (frontFaceCW) desc.flags = desc.flags | RtGeometryInstanceFlags::TriangleFrontCounterClockwise;
+
+            // From the scene builder we can expect the following:
+            //
+            // If BLAS is marked as static:
+            // - The meshes are pre-transformed to world-space.
+            // - The meshes are guaranteed to be non-instanced, so only one INSTANCE_DESC with an identity transform is needed.
+            //
+            // If BLAS is not marked as static:
+            // - The meshes are guaranteed to be non-instanced or be identically instanced, one INSTANCE_DESC per TLAS instance is needed.
+            // - The global matrices are the same for all meshes in an instance.
+            //
+            FALCOR_ASSERT(!meshList.empty());
+            size_t instanceCount = mMeshIdToInstanceIds[meshList[0].get()].size();
+
+            FALCOR_ASSERT(instanceCount > 0);
+            for (size_t instanceIdx = 0; instanceIdx < instanceCount; instanceIdx++)
+            {
+                // Validate that the ordering is matching our expectations:
+                // InstanceID() + GeometryIndex() should look up the correct mesh instance.
+                for (uint32_t geometryIndex = 0; geometryIndex < (uint32_t)meshList.size(); geometryIndex++)
+                {
+                    const auto& instances = mMeshIdToInstanceIds[meshList[geometryIndex].get()];
+                    FALCOR_ASSERT(instances.size() == instanceCount);
+                    FALCOR_ASSERT(instances[instanceIdx] == instanceID + geometryIndex);
+                }
+
+                desc.instanceID = instanceID;
+                instanceID += (uint32_t)meshList.size();
+
+                float4x4 transform4x4 = float4x4::identity();
+                // if (!isStatic)
+                // {
+                //     // For non-static meshes, the matrices for all meshes in an instance are guaranteed to be the same.
+                //     // Just pick the matrix from the first mesh.
+                //     const uint32_t matrixId = mGeometryInstanceData[desc.instanceID].globalMatrixID;
+                //     transform4x4 = mpAnimationController->getGlobalMatrices()[matrixId];
+
+                //     // Verify that all meshes have matching tranforms.
+                //     for (uint32_t geometryIndex = 0; geometryIndex < (uint32_t)meshList.size(); geometryIndex++)
+                //     {
+                //         FALCOR_ASSERT(matrixId == mGeometryInstanceData[desc.instanceID + geometryIndex].globalMatrixID);
+                //     }
+                // }
+                std::memcpy(desc.transform, &transform4x4, sizeof(desc.transform));
+
+                // Verify that instance data has the correct instanceIndex and geometryIndex.
+                for (uint32_t geometryIndex = 0; geometryIndex < (uint32_t)meshList.size(); geometryIndex++)
+                {
+                    FALCOR_ASSERT((uint32_t)instanceDescs.size() == mGeometryInstanceData[desc.instanceID + geometryIndex].instanceIndex);
+                    FALCOR_ASSERT(geometryIndex == mGeometryInstanceData[desc.instanceID + geometryIndex].geometryIndex);
+                }
+
+                instanceDescs.push_back(desc);
+            }
+        }
+
+        // uint32_t totalBlasCount = (uint32_t)mMeshGroups.size() + (mCurveDesc.empty() ? 0 : 1) + getSDFGridGeometryCount() + (mCustomPrimitiveDesc.empty() ? 0 : 1);
+        // FALCOR_ASSERT((uint32_t)mBlasData.size() == totalBlasCount);
+
+        // size_t blasDataIndex = mMeshGroups.size();
+        // // One instance for curves.
+        // if (!mCurveDesc.empty())
+        // {
+        //     const auto& blasData = mBlasData[blasDataIndex++];
+        //     FALCOR_ASSERT(blasData.blasGroupIndex < mBlasGroups.size());
+        //     const auto& pBlas = mBlasGroups[blasData.blasGroupIndex].pBlas;
+        //     FALCOR_ASSERT(pBlas);
+
+        //     RtInstanceDesc desc = {};
+        //     desc.accelerationStructure = pBlas->getGpuAddress() + blasData.blasByteOffset;
+        //     desc.instanceMask = 0xFF;
+        //     desc.instanceID = instanceID;
+        //     instanceID += (uint32_t)mCurveDesc.size();
+
+        //     // Start procedural primitive hit group after the triangle hit groups.
+        //     desc.instanceContributionToHitGroupIndex = perMeshHitEntry ? instanceContributionToHitGroupIndex : 0;
+
+        //     instanceContributionToHitGroupIndex += rayTypeCount * (uint32_t)mCurveDesc.size();
+
+        //     // For cached curves, the matrices for all curves in an instance are guaranteed to be the same.
+        //     // Just pick the matrix from the first curve.
+        //     auto it = std::find_if(mGeometryInstanceData.begin(), mGeometryInstanceData.end(), [](const auto& inst) { return inst.getType() == GeometryType::Curve; });
+        //     FALCOR_ASSERT(it != mGeometryInstanceData.end());
+        //     const uint32_t matrixId = it->globalMatrixID;
+        //     desc.setTransform(mpAnimationController->getGlobalMatrices()[matrixId]);
+
+        //     // Verify that instance data has the correct instanceIndex and geometryIndex.
+        //     for (uint32_t geometryIndex = 0; geometryIndex < (uint32_t)mCurveDesc.size(); geometryIndex++)
+        //     {
+        //         FALCOR_ASSERT((uint32_t)instanceDescs.size() == mGeometryInstanceData[desc.instanceID + geometryIndex].instanceIndex);
+        //         FALCOR_ASSERT(geometryIndex == mGeometryInstanceData[desc.instanceID + geometryIndex].geometryIndex);
+        //     }
+
+        //     instanceDescs.push_back(desc);
+        // }
+
+        // // One instance per SDF grid instance.
+        // if (!mSDFGrids.empty())
+        // {
+        //     bool sdfGridInstancesHaveUniqueBLASes = true;
+        //     switch (mSDFGridConfig.implementation)
+        //     {
+        //     case SDFGrid::Type::NormalizedDenseGrid:
+        //     case SDFGrid::Type::SparseVoxelOctree:
+        //         sdfGridInstancesHaveUniqueBLASes = false;
+        //         break;
+        //     case SDFGrid::Type::SparseVoxelSet:
+        //     case SDFGrid::Type::SparseBrickSet:
+        //         sdfGridInstancesHaveUniqueBLASes = true;
+        //         break;
+        //     default:
+        //         FALCOR_UNREACHABLE();
+        //     }
+
+        //     for (const GeometryInstanceData& instance : mGeometryInstanceData)
+        //     {
+        //         if (instance.getType() != GeometryType::SDFGrid) continue;
+
+        //         const BlasData& blasData = mBlasData[blasDataIndex + (sdfGridInstancesHaveUniqueBLASes ? instance.geometryID : 0)];
+        //         const auto& pBlas = mBlasGroups[blasData.blasGroupIndex].pBlas;
+
+        //         RtInstanceDesc desc = {};
+        //         desc.accelerationStructure = pBlas->getGpuAddress() + blasData.blasByteOffset;
+        //         desc.instanceMask = 0xFF;
+        //         desc.instanceID = instanceID;
+        //         instanceID++;
+
+        //         // Start SDF grid hit group after the curve hit groups.
+        //         desc.instanceContributionToHitGroupIndex = perMeshHitEntry ? instanceContributionToHitGroupIndex : 0;
+
+        //         desc.setTransform(mpAnimationController->getGlobalMatrices()[instance.globalMatrixID]);
+
+        //         // Verify that instance data has the correct instanceIndex and geometryIndex.
+        //         FALCOR_ASSERT((uint32_t)instanceDescs.size() == instance.instanceIndex);
+        //         FALCOR_ASSERT(0 == instance.geometryIndex);
+
+        //         instanceDescs.push_back(desc);
+        //     }
+
+        //     blasDataIndex += (sdfGridInstancesHaveUniqueBLASes ? mSDFGrids.size() : 1);
+        //     instanceContributionToHitGroupIndex += rayTypeCount * (uint32_t)mSDFGridDesc.size();
+        // }
+
+        // // One instance with identity transform for custom primitives.
+        // if (!mCustomPrimitiveDesc.empty())
+        // {
+        //     FALCOR_ASSERT(mBlasData.back().blasGroupIndex < mBlasGroups.size());
+        //     const auto& pBlas = mBlasGroups[mBlasData.back().blasGroupIndex].pBlas;
+        //     FALCOR_ASSERT(pBlas);
+
+        //     RtInstanceDesc desc = {};
+        //     desc.accelerationStructure = pBlas->getGpuAddress() + mBlasData.back().blasByteOffset;
+        //     desc.instanceMask = 0xFF;
+        //     desc.instanceID = instanceID;
+        //     instanceID += (uint32_t)mCustomPrimitiveDesc.size();
+
+        //     // Start procedural primitive hit group after the curve hit group.
+        //     desc.instanceContributionToHitGroupIndex = perMeshHitEntry ? instanceContributionToHitGroupIndex : 0;
+
+        //     instanceContributionToHitGroupIndex += rayTypeCount * (uint32_t)mCustomPrimitiveDesc.size();
+
+        //     float4x4 identityMat = float4x4::identity();
+        //     std::memcpy(desc.transform, &identityMat, sizeof(desc.transform));
+        //     instanceDescs.push_back(desc);
+        // }
+    }
+
+    void Scene::buildUVTlas(RenderContext* pRenderContext, uint32_t rayTypeCount, bool perMeshHitEntry)
+    {
+        FALCOR_PROFILE(pRenderContext, "buildTlas");
+
+        TlasData tlas;
+        auto it = mUVTlasCache.find(rayTypeCount);
+        if (it != mUVTlasCache.end()) tlas = it->second;
+
+        // Prepare instance descs.
+        // Note if there are no instances, we'll build an empty TLAS.
+        fillUVInstanceDesc(mUVInstanceDescs, rayTypeCount, perMeshHitEntry);
+
+        RtAccelerationStructureBuildInputs inputs = {};
+        inputs.kind = RtAccelerationStructureKind::TopLevel;
+        inputs.descCount = (uint32_t)mUVInstanceDescs.size();
+        inputs.flags = RtAccelerationStructureBuildFlags::None;
+
+        // Add build flags for dynamic scenes if TLAS should be updating instead of rebuilt
+        if ((mpAnimationController->hasAnimations() || mpAnimationController->hasAnimatedVertexCaches()) && mTlasUpdateMode == UpdateMode::Refit)
+        {
+            inputs.flags |= RtAccelerationStructureBuildFlags::AllowUpdate;
+
+            // If TLAS has been built already and it was built with ALLOW_UPDATE
+            if (tlas.pTlasObject != nullptr && tlas.updateMode == UpdateMode::Refit) inputs.flags |= RtAccelerationStructureBuildFlags::PerformUpdate;
+        }
+
+        tlas.updateMode = mTlasUpdateMode;
+
+        // On first build for the scene, create scratch buffer and cache prebuild info. As long as INSTANCE_DESC count doesn't change, we can reuse these
+        if (mpUVTlasScratch == nullptr)
+        {
+            // Prebuild
+            mUVTlasPrebuildInfo = RtAccelerationStructure::getPrebuildInfo(mpDevice.get(), inputs);
+            mpUVTlasScratch = mpDevice->createBuffer(mUVTlasPrebuildInfo.scratchDataSize, ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal);
+            mpUVTlasScratch->setName("Scene::mpUVTlasScratch");
+
+            // #SCENE This isn't guaranteed according to the spec, and the scratch buffer being stored should be sized differently depending on update mode
+            FALCOR_ASSERT(mUVTlasPrebuildInfo.updateScratchDataSize <= mUVTlasPrebuildInfo.scratchDataSize);
+        }
+
+        // Setup GPU buffers
+        RtAccelerationStructure::BuildDesc asDesc = {};
+        asDesc.inputs = inputs;
+
+        // If first time building this TLAS
+        if (tlas.pTlasObject == nullptr)
+        {
+            {
+                // Allocate a new buffer for the TLAS only if the existing buffer isn't big enough.
+                if (!tlas.pTlasBuffer || tlas.pTlasBuffer->getSize() < mUVTlasPrebuildInfo.resultDataMaxSize)
+                {
+                    tlas.pTlasBuffer = mpDevice->createBuffer(mUVTlasPrebuildInfo.resultDataMaxSize, ResourceBindFlags::AccelerationStructure, MemoryType::DeviceLocal);
+                    tlas.pTlasBuffer->setName("Scene UVTLAS buffer");
+                }
+            }
+
+            RtAccelerationStructure::Desc asCreateDesc = {};
+            asCreateDesc.setKind(RtAccelerationStructureKind::TopLevel);
+            asCreateDesc.setBuffer(tlas.pTlasBuffer, 0, mTlasPrebuildInfo.resultDataMaxSize);
+            tlas.pTlasObject = RtAccelerationStructure::create(mpDevice, asCreateDesc);
+        }
+        // Else barrier TLAS buffers
+        else
+        {
+            FALCOR_ASSERT(mpAnimationController->hasAnimations() || mpAnimationController->hasAnimatedVertexCaches());
+            pRenderContext->uavBarrier(tlas.pTlasBuffer.get());
+            pRenderContext->uavBarrier(mpUVTlasScratch.get());
+            asDesc.source = tlas.pTlasObject.get(); // Perform the update in-place
+        }
+
+        FALCOR_ASSERT(tlas.pTlasBuffer && tlas.pTlasBuffer->getGfxResource() && mpUVTlasScratch->getGfxResource());
+
+        // Upload instance data
+        if (inputs.descCount > 0)
+        {
+            GpuMemoryHeap::Allocation allocation = mpDevice->getUploadHeap()->allocate(inputs.descCount * sizeof(RtInstanceDesc), sizeof(RtInstanceDesc));
+            std::memcpy(allocation.pData, mUVInstanceDescs.data(), inputs.descCount * sizeof(RtInstanceDesc));
+            asDesc.inputs.instanceDescs = allocation.getGpuAddress();
+            mpDevice->getUploadHeap()->release(allocation);
+        }
+        asDesc.scratchData = mpUVTlasScratch->getGpuAddress();
+        asDesc.dest = tlas.pTlasObject.get();
+
+        // Set the source buffer to update in place if this is an update
+        if ((inputs.flags & RtAccelerationStructureBuildFlags::PerformUpdate) != RtAccelerationStructureBuildFlags::None)
+        {
+            asDesc.source = asDesc.dest;
+        }
+
+        // Create TLAS
+        pRenderContext->buildAccelerationStructure(asDesc, 0, nullptr);
+        pRenderContext->uavBarrier(tlas.pTlasBuffer.get());
+
+        mUVTlasCache[rayTypeCount] = tlas;
+        // updateRaytracingTLASStats();
+        mUVTlasLastBuiltRayCount = rayTypeCount;
     }
 
     void Scene::bindShaderDataForRaytracing(RenderContext* pRenderContext, const ShaderVar& sceneVar, uint32_t rayTypeCount)
@@ -4029,33 +5020,58 @@ namespace Falcor
         {
             initGeomDesc(pRenderContext);
             buildBlas(pRenderContext);
+
+            initUVGeomDesc(pRenderContext);
+            buildUVBlas(pRenderContext);
         }
 
+
         // Find any valid TLAS, if none found, create it for rayTypeCount == 1
-        if (rayTypeCount == 0)
-            rayTypeCount = mTlasLastBuiltRayCount;
-        if (rayTypeCount == 0)
-            rayTypeCount = 1;
+        // if (rayTypeCount == 0)
+        //     rayTypeCount = mTlasLastBuiltRayCount;
+        // if (rayTypeCount == 0)
+        //     rayTypeCount = 1;
 
         // On first execution, when meshes have moved, when there's a new ray type count, or when a BLAS has changed, create/update the TLAS
         //
         // The raytracing shader table has one hit record per ray type and geometry. We need to know the ray type count in order to setup the indexing properly.
         // Note that for DXR 1.1 ray queries, the shader table is not used and the ray type count doesn't matter and can be set to zero.
         //
-        auto tlasIt = mTlasCache.find(rayTypeCount);
+        auto tlasIt = mTlasCache.find(2 * rayTypeCount + mFrameIndex);
         if (tlasIt == mTlasCache.end() || !tlasIt->second.pTlasObject)
         {
             // We need a hit entry per mesh right now to pass GeometryIndex()
             buildTlas(pRenderContext, rayTypeCount, true);
 
             // If new TLAS was just created, get it so the iterator is valid
-            if (tlasIt == mTlasCache.end()) tlasIt = mTlasCache.find(rayTypeCount);
+            if (tlasIt == mTlasCache.end()) tlasIt = mTlasCache.find(2 * rayTypeCount + mFrameIndex);
+        }
+
+        auto uvTlasIt = mUVTlasCache.find(rayTypeCount);
+        if (uvTlasIt == mUVTlasCache.end() || !tlasIt->second.pTlasObject)
+        {
+            buildUVTlas(pRenderContext, rayTypeCount, true);
+            if (uvTlasIt == mUVTlasCache.end()) uvTlasIt = mUVTlasCache.find(rayTypeCount);
         }
         FALCOR_ASSERT(mpSceneBlock);
+
+        auto prevTlasIt = mTlasCache.find(2 * rayTypeCount + 1 - mFrameIndex);
+        if (prevTlasIt != mTlasCache.end() && prevTlasIt->second.pTlasObject)
+        {
+            mpSceneBlock->getRootVar()["prevRtAccel"].setAccelerationStructure(prevTlasIt->second.pTlasObject);
+        }
+        else
+        {
+            mpSceneBlock->getRootVar()["prevRtAccel"].setAccelerationStructure(tlasIt->second.pTlasObject);
+        }
 
         // Bind TLAS.
         FALCOR_ASSERT(tlasIt != mTlasCache.end() && tlasIt->second.pTlasObject)
         mpSceneBlock->getRootVar()["rtAccel"].setAccelerationStructure(tlasIt->second.pTlasObject);
+
+        // Bind UV Tlas
+        FALCOR_ASSERT(uvTlasIt != mUVTlasCache.end() && uvTlasIt->second.pTlasObject)
+        mpSceneBlock->getRootVar()["uvRTAccel"].setAccelerationStructure(uvTlasIt->second.pTlasObject);
 
         // Bind Scene parameter block.
         getCamera()->bindShaderData(mpSceneBlock->getRootVar()[kCamera]); // TODO REMOVE: Shouldn't be needed anymore?
@@ -4182,6 +5198,12 @@ namespace Falcor
             {
                 auto camera = mCameras[mSelectedCamera];
             }
+            else if (keyEvent.key == Input::Key::G)
+            {
+                auto curLevel = mLoDLevels[mLoDNameToIndex.at("Rock")];
+                setLoDLevel("Rock", (curLevel + 1) % 2);
+                return true;
+            }
         }
         if (mCameraControlsEnabled)
         {
@@ -4193,6 +5215,13 @@ namespace Falcor
                 return true;
             }
         }
+
+        // if (keyEvent.key == Input::Key::G)
+        // {
+        //     auto curLevel = mLoDLevels[mLoDNameToIndex.at("Monkey")];
+        //     setLoDLevel("Monkey", (curLevel + 1) % 2);
+        //     return true;
+        // }
 
         return false;
     }
@@ -4309,6 +5338,38 @@ namespace Falcor
 
         // Update BLAS/TLAS.
         updateForInverseRendering(mpDevice->getRenderContext(), false, true);
+    }
+
+    bool Scene::setLoDLevel(const std::string& loDName, int level)
+    {
+        if (mLoDNameToIndex.find(loDName) == mLoDNameToIndex.end()) {
+            return false;
+        }
+
+        logInfo("Setting LoD '{}' to level {}.", loDName, level);
+        mLoDLevels[mLoDNameToIndex.at(loDName)] = level;
+        mIsLoDChanged = true;
+        return true;
+    }
+
+    bool Scene::raiseLoDLevel(const std::string& loDName)
+    {
+        if (mLoDNameToIndex.find(loDName) == mLoDNameToIndex.end()) {
+            return false;
+        }
+        uint curLevel = mLoDLevels[mLoDNameToIndex.at(loDName)];
+
+        return setLoDLevel(loDName, curLevel + 1);
+    }
+
+    bool Scene::lowerLoDLevel(const std::string& loDName)
+    {
+        if (mLoDNameToIndex.find(loDName) == mLoDNameToIndex.end()) {
+            return false;
+        }
+        uint curLevel = mLoDLevels[mLoDNameToIndex.at(loDName)];
+
+        return setLoDLevel(loDName, curLevel - 1);
     }
 
     inline pybind11::dict toPython(const Scene::SceneStats& stats)
@@ -4587,5 +5648,13 @@ namespace Falcor
         scene.def("get_mesh", &Scene::getMesh, "mesh_id"_a);
         scene.def("get_mesh_vertices_and_indices", getMeshVerticesAndIndicesPython, "mesh_id"_a, "buffers"_a);
         scene.def("set_mesh_vertices", setMeshVerticesPython, "mesh_id"_a, "buffers"_a);
+        scene.def("get_mesh_name", &Scene::getMeshName, "mesh_id"_a);
+        scene.def("get_mesh_bounds", &Scene::getMeshBounds, "mesh_id"_a);
+        scene.def("get_mesh_count", &Scene::getMeshCount);
+
+        scene.def("update_node_transform", &Scene::updateNodeTransform, "node_id"_a, "transform"_a);
+        scene.def("raise_lod_level", &Scene::raiseLoDLevel, "loD_name"_a);
+        scene.def("lower_lod_level", &Scene::lowerLoDLevel, "loD_name"_a);
+        scene.def("set_lod_level", &Scene::setLoDLevel, "loD_name"_a, "level"_a);
     }
 }

@@ -34,8 +34,9 @@ interface ISampleGenerator
     /**
      * Returns the next sample value. This function updates the state.
      */
-    [mutating]
-    uint next();
+    uint getCount();
+    [mutating] uint next();
+    [mutating] void setCount(uint newValue);
 };
 
 /**
@@ -83,4 +84,9 @@ float4 sampleNext4D<S : ISampleGenerator>(inout S sg)
     sample.z = sampleNext1D(sg);
     sample.w = sampleNext1D(sg);
     return sample;
+}
+
+void consumedSample<S : ISampleGenerator>(inout S sg, uint n)
+{
+    for (uint i = 0; i < n; ++i) sg.next();
 }

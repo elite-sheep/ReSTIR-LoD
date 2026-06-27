@@ -18,13 +18,14 @@ def render_graph_ReservoirSplatting():
         'numTimePartitions': 2,
         'hybridMISOption': "Balance",
         'gatherOption': "Fast",
+        'maxSurfaceBounces': 1,
     }
 
     VBufferRT = createPass("VBufferRT", VBufferParams)
     g.addPass(VBufferRT, "VBufferRT")
     ReservoirSplatting = createPass("ReservoirSplatting", ReservoirSplattingParams)
     g.addPass(ReservoirSplatting, "ReservoirSplatting")
-    AccumulatePass = createPass("AccumulatePass", {'enabled': False, 'precisionMode': 'Single'})
+    AccumulatePass = createPass("AccumulatePass", {'enabled': True, 'precisionMode': 'Single'})
     g.addPass(AccumulatePass, "AccumulatePass")
     ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
     g.addPass(ToneMapper, "ToneMapper")
@@ -38,7 +39,7 @@ def render_graph_ReservoirSplatting():
     # g.markOutput("ToneMapper.dst")
     g.addEdge("ToneMapper.dst", "FrameDumper.src")
     g.markOutput("FrameDumper.dst")
-    g.markOutput("AccumulatePass.output")
+    g.markOutput("ReservoirSplatting.color")
     return g
 
 ReservoirSplatting = render_graph_ReservoirSplatting()

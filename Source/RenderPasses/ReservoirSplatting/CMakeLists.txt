@@ -21,21 +21,24 @@ target_sources(ReservoirSplatting PRIVATE
     InitialCandidates.cs.slang
     # Gather Temporal Resampling
     GatherHelper.slang
-    RobustReuseOptimization.rt.slang
+    RobustReuseOptimization.cs.slang
     CollectTemporalSamples.cs.slang
-    GatherTemporalResampling.rt.slang
+    GatherTemporalResampling.cs.slang
     # Scatter Temporal Resampling
-    ReprojectTemporalSamples.rt.slang
+    ReprojectTemporalSamples.cs.slang
     SortReprojectedReservoirs.cs.slang
-    ScatterTemporalResampling.rt.slang
+    ScatterTemporalResampling.cs.slang
     # Scatter + Backup Temporal Resampling
-    ScatterBackupTemporalResampling.rt.slang
+    ScatterBackupTemporalResampling.cs.slang
     # Multi-Scatter Temporal Resampling
-    MultiReprojectTemporalSamples.rt.slang
+    MultiReprojectTemporalSamples.cs.slang
     MultiSortReprojectedReservoirs.cs.slang
-    MultiScatterTemporalResampling.rt.slang
+    MultiScatterTemporalResampling.cs.slang
+    # Random-Replay Temporal Resampling
+    RandomReplayTemporalResampling.cs.slang
+    RandomReplayTemporalSamples.cs.slang
     # Spatial Resampling
-    SpatialResampling.rt.slang
+    SpatialResampling.cs.slang
     # Resolve ReSTIR
     ResolveReSTIR.cs.slang
     # Visualization Utility

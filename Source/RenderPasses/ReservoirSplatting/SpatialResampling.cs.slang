@@ -25,7 +25,7 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
@@ -110,7 +110,7 @@ struct SpatialResampling
         for (uint32_t i = 0; i < neighborCount; i++)
         {
             // Lens vertex copy or primary hit reconnection, depending on which index we're at.
-            bool lensVertexCopyShift = (i < numLensVertexCopyShifts);
+            bool lensVertexCopyShift = i & 1;
 
             // Get the neighbor pixel.
             uint32_t neighborOffsetIdx = (startIdx + i) % kSpatialNeighborSamples;
@@ -130,9 +130,9 @@ struct SpatialResampling
                 float2 fractionalPixel = float2(neighborPixel) + centralReservoir.subPixel;
                 ShiftedPathData shiftedCentral = lensVertexCopyShift ? gatherLensVertexCopyShift(sg, centralReconnection, centralReconnection.time, fractionalPixel, centralReconnection.lensSample)
                                                                      : gatherPrimaryHitReconnectionShift( sg, centralReconnection, centralReconnection.time, fractionalPixel, centralReconnection.firstHit);
-                
+
                 // The lens vertex copy does not include the lens vertex Jacobian.
-                float shiftedJacobian = (lensVertexCopyShift ? 1.0f : (shiftedCentral.lensVertexJacobian / centralReconnection.lensVertexJacobian)) * 
+                float shiftedJacobian = (lensVertexCopyShift ? 1.0f : (shiftedCentral.lensVertexJacobian / centralReconnection.lensVertexJacobian)) *
                                                                 (shiftedCentral.secondaryPathJacobian / centralReconnection.secondaryPathJacobian);
 
                 m1 = luminance(shiftedCentral.radiance) * shiftedJacobian * (useConfidenceWeights ? neighborReservoir.confidence : 1.0f);
@@ -194,11 +194,11 @@ cbuffer CB
 // Shader entry point for ray generation shader.
 //
 
-[shader("raygeneration")]
-void rayGen()
+[numthreads(8, 16, 1)]
+void main(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    uint2 pixel = dispatchThreadId.xy;
+    uint2 frameDim = gSpatialResampling.params.frameDim;
     if (all(pixel >= frameDim)) return;
 
     printSetPixel(pixel);

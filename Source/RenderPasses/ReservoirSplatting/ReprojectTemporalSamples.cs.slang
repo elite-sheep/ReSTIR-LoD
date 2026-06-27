@@ -25,11 +25,12 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
- 
+
 #include "Utils/Math/MathConstants.slangh"
 #include "Scene/SceneDefines.slangh"
 #include "RaytracingCommon.slang"
 
+import Scene.RaytracingInline;
 import Utils.Color.ColorHelpers;
 import Utils.Debug.PixelDebug;
 
@@ -98,7 +99,25 @@ struct ReprojectTemporalSamples
         if (prevReconnection.firstHit.isValid())
         {
             // If the primary hit exists, we want to get the location.
-            ShadingData firstSd = loadShadingData(prevReconnection.firstHit, prevCamera.data.posW, float3(0.0f, 0.0f, 0.0f));
+            HitInfo projectedHit = prevReconnection.firstHit;
+            uint lodIndex = gScene.instanceIDToLoDIndex[prevReconnection.firstHit.getInstanceID().index];
+            if (gScene.prevLoDLevels[lodIndex] >= 0 && gScene.prevLoDLevels[lodIndex] != gScene.loDLevels[lodIndex])
+            {
+                SceneUVRayQuery uvQuery;
+                Ray uvRay = Ray(float3(lodIndex * kUVCompressRatio - kUVRayEpsilon, prevReconnection.firstTextureUV),
+                                float3(1.0, 0.0, 0.0),
+                                0.0f, kUVRayTMax);
+                uint lodInstanceMask = (1 << gScene.loDLevels[lodIndex]);
+                UVHitInfo uvHitInfo = uvQuery.traceRay(uvRay, RAY_FLAG_FORCE_NON_OPAQUE, lodInstanceMask);
+                projectedHit = findCloestHitInUVHitInfo(uvHitInfo, prevReconnection.firstHit);
+            }
+
+            if (!projectedHit.isValid())
+            {
+                return;
+            }
+
+            ShadingData firstSd = loadShadingData(projectedHit, prevCamera.data.posW, float3(0.0f, 0.0f, 0.0f));
             float3 x1 = firstSd.posW;
 
             newRay.dir = normalize(x1 - newRay.origin);
@@ -161,7 +180,7 @@ struct ReprojectTemporalSamples
         uint2 newPixel = uint2(floor(newFractionalPixel));
         uint linearizedIndex = params.linearizePixel(newPixel);
 
-        print("Current Pixel", pixel); 
+        print("Current Pixel", pixel);
         print("New Pixel", newPixel);
 
         uint index;
@@ -184,11 +203,11 @@ cbuffer CB
 // Shader entry point for ray generation shader.
 //
 
-[shader("raygeneration")]
-void rayGen()
+[numthreads(8, 16, 1)]
+void main(uint3 dispatchThreadId: SV_DispatchThreadID)
 {
-    uint2 pixel = DispatchRaysIndex().xy;
-    uint2 frameDim = DispatchRaysDimensions().xy;
+    uint2 pixel = dispatchThreadId.xy;
+    uint2 frameDim = gReprojectTemporalSamples.params.frameDim;
     if (all(pixel >= frameDim)) return;
 
     printSetPixel(pixel);
